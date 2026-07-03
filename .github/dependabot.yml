@@ -1,0 +1,33 @@
+version: 2
+updates:
+  # Go module dependencies. Minor/patch bumps are grouped into one PR; majors
+  # (potentially breaking) get individual PRs.
+  - package-ecosystem: gomod
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    labels: ["dependencies", "go"]
+    open-pull-requests-limit: 10
+    groups:
+      go-minor-patch:
+        update-types: [minor, patch]
+
+  # GitHub Actions used by the workflows above.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    labels: ["dependencies", "ci"]
+    groups:
+      actions:
+        patterns: ["*"]
+
+  # Base images in the Dockerfile.
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    labels: ["dependencies", "docker"]
