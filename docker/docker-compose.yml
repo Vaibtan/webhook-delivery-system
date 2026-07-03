@@ -1,0 +1,46 @@
+# Local development infrastructure for the Go webhook delivery system.
+# Distinct project name keeps it isolated from the Python stack's compose file.
+#
+#   docker compose -f docker/docker-compose.yml up -d
+#
+# Matching local env:
+#   DATABASE_URL=postgres://webhook:webhook@localhost:5432/webhook?sslmode=disable
+#   REDIS_URL=redis://localhost:6379/0
+name: webhook-go
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: webhook
+      POSTGRES_PASSWORD: webhook
+      POSTGRES_DB: webhook
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U webhook -d webhook"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    # AOF persistence so the queue/schedule/DLQ survive a restart (everyappendfsync).
+    command: ["redis-server", "--appendonly", "yes", "--appendfsync", "everysec"]
+    ports:
+      - "6379:6379"
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+volumes:
+  pgdata:
+  redisdata:

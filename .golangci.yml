@@ -1,0 +1,36 @@
+# golangci-lint v2 configuration.
+version: "2"
+
+run:
+  timeout: 5m
+  build-tags:
+    - integration
+
+linters:
+  # The standard set (errcheck, govet, ineffassign, staticcheck, unused) plus a
+  # few high-signal additions.
+  default: standard
+  enable:
+    - bodyclose   # response bodies must be closed
+    - errorlint   # correct errors.Is/As usage & %w wrapping
+    - noctx       # HTTP requests must carry a context
+    - unconvert   # redundant type conversions
+    - misspell    # common misspellings in comments/strings
+  exclusions:
+    generated: lax
+    rules:
+      # Test helpers intentionally ignore some errors / use background contexts.
+      - path: _test\.go
+        linters:
+          - errcheck
+          - bodyclose
+          - noctx
+
+formatters:
+  enable:
+    - gofmt
+    - goimports
+  settings:
+    goimports:
+      local-prefixes:
+        - github.com/Vaibtan/webhook-delivery-system
