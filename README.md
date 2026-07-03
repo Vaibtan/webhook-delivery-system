@@ -1,7 +1,6 @@
 # Go Webhook Delivery System
 
 [![CI](https://github.com/Vaibtan/webhook-delivery-system/actions/workflows/ci.yml/badge.svg)](https://github.com/Vaibtan/webhook-delivery-system/actions/workflows/ci.yml)
-[![Security](https://github.com/Vaibtan/webhook-delivery-system/actions/workflows/security.yml/badge.svg)](https://github.com/Vaibtan/webhook-delivery-system/actions/workflows/security.yml)
 [![Go](https://img.shields.io/badge/go-1.26-00ADD8?logo=go&logoColor=white)](go.mod)
 
 A production-grade webhook delivery service written in **Go 1.26** — a portfolio port of a Python FastAPI/Celery service. It accepts signed webhook events, persists every delivery attempt to PostgreSQL, and delivers them to subscriber endpoints with at-least-once semantics: exponential backoff with jitter, a per-URL circuit breaker, per-subscription rate limiting and concurrency control, secret rotation with a grace window, replay-attack protection, SSRF-safe outbound dialing, and a dead-letter queue with replay. Celery is replaced entirely by native Go concurrency (a bounded goroutine worker pool over a Redis queue + sorted-set retry scheduler). The runtime depends on **three third-party packages** — [`pgx/v5`](https://github.com/jackc/pgx), [`go-redis/v9`](https://github.com/redis/go-redis), [`golang-migrate`](https://github.com/golang-migrate/migrate) — **plus `golang.org/x/sync`** (the Go team's extended-stdlib `errgroup`); everything else is the standard library.
@@ -417,7 +416,7 @@ make lint                           # golangci-lint, clean
   - concurrent replay produces exactly one new chain,
   - recovery reclaims orphaned `pending` rows.
 - The codebase is **golangci-lint clean**.
-- **Continuous integration** ([`.github/workflows`](.github/workflows)): every push and pull request runs lint (`go vet` + `gofmt` + golangci-lint), the unit suite under the race detector (`go test -race -shuffle=on`), and the full integration suite against ephemeral Postgres + Redis service containers (migrated first). A `govulncheck` scan runs on push/PR and weekly, and Dependabot tracks module, Actions and Docker updates. The race detector runs on the Linux runners (CGO available) where it cannot on the Windows dev box.
+- **Continuous integration** ([`.github/workflows`](.github/workflows)): every push and pull request runs lint (`go vet` + `gofmt` + golangci-lint), the unit suite under the race detector (`go test -race -shuffle=on`), and the full integration suite against ephemeral Postgres + Redis service containers (migrated first). Dependabot tracks module, Actions and Docker updates. The race detector runs on the Linux runners (CGO available) where it cannot on the Windows dev box.
 
 ---
 
