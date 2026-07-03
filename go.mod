@@ -1,6 +1,6 @@
 module github.com/Vaibtan/webhook-delivery-system
 
-go 1.26.2
+go 1.26.4
 
 require (
 	github.com/golang-migrate/migrate/v4 v4.19.1
