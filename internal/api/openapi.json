@@ -1,0 +1,1591 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "Webhook Delivery System API",
+    "version": "1.0.0",
+    "description": "API for a webhook delivery service that ingests webhooks via per-subscription HMAC-signed requests and delivers them to configured targets with retries, dead-letter handling, replay, and delivery monitoring. Admin endpoints are authenticated with a bearer admin API key; the ingest endpoint is authenticated per subscription via HMAC headers."
+  },
+  "servers": [
+    {
+      "url": "/api/v1"
+    }
+  ],
+  "components": {
+    "securitySchemes": {
+      "bearerAuth": {
+        "type": "http",
+        "scheme": "bearer",
+        "description": "Admin API key passed as 'Authorization: Bearer <ADMIN_API_KEY>'."
+      }
+    },
+    "schemas": {
+      "Error": {
+        "type": "object",
+        "properties": {
+          "error": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "error"
+        ],
+        "example": {
+          "error": "subscription not found"
+        }
+      },
+      "Subscription": {
+        "type": "object",
+        "description": "A webhook subscription. Never includes secret_key or previous_secret_key.",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "target_url": {
+            "type": "string"
+          },
+          "event_types": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Event types this subscription receives. Empty means all events."
+          },
+          "is_active": {
+            "type": "boolean"
+          },
+          "consecutive_failures": {
+            "type": "integer"
+          },
+          "secret_rotated_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time"
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "updated_at": {
+            "type": "string",
+            "format": "date-time"
+          }
+        },
+        "required": [
+          "id",
+          "target_url",
+          "event_types",
+          "is_active",
+          "consecutive_failures",
+          "created_at",
+          "updated_at"
+        ],
+        "example": {
+          "id": "3fa85f64-5717-4562-b3fc-2c963f66afa6",
+          "target_url": "https://example.com/webhooks",
+          "event_types": [
+            "order.created",
+            "order.updated"
+          ],
+          "is_active": true,
+          "consecutive_failures": 0,
+          "secret_rotated_at": null,
+          "created_at": "2026-06-21T10:00:00Z",
+          "updated_at": "2026-06-21T10:00:00Z"
+        }
+      },
+      "SubscriptionWithSecret": {
+        "description": "A subscription including its signing secret. Only returned at create and rotate-secret; the secret is shown exactly once.",
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/Subscription"
+          },
+          {
+            "type": "object",
+            "properties": {
+              "secret_key": {
+                "type": "string",
+                "description": "The HMAC signing secret. Shown only once; store it securely."
+              }
+            },
+            "required": [
+              "secret_key"
+            ]
+          }
+        ],
+        "example": {
+          "id": "3fa85f64-5717-4562-b3fc-2c963f66afa6",
+          "target_url": "https://example.com/webhooks",
+          "event_types": [
+            "order.created"
+          ],
+          "is_active": true,
+          "consecutive_failures": 0,
+          "secret_rotated_at": null,
+          "created_at": "2026-06-21T10:00:00Z",
+          "updated_at": "2026-06-21T10:00:00Z",
+          "secret_key": "whsec_8f3a2b1c9d4e5f6a7b8c9d0e1f2a3b4c"
+        }
+      },
+      "Attempt": {
+        "type": "object",
+        "description": "A delivery attempt record for a webhook.",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "webhook_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "event_type": {
+            "type": "string"
+          },
+          "attempt_number": {
+            "type": "integer"
+          },
+          "replay_number": {
+            "type": "integer"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "pending",
+              "success",
+              "failed_attempt",
+              "final_failure"
+            ]
+          },
+          "http_status": {
+            "type": "integer"
+          },
+          "error_details": {
+            "type": "string"
+          },
+          "next_retry_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "in_dlq": {
+            "type": "boolean"
+          },
+          "payload": {
+            "type": "object",
+            "additionalProperties": true
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "updated_at": {
+            "type": "string",
+            "format": "date-time"
+          }
+        },
+        "required": [
+          "id",
+          "webhook_id",
+          "attempt_number",
+          "replay_number",
+          "status",
+          "in_dlq",
+          "created_at",
+          "updated_at"
+        ],
+        "example": {
+          "id": "9c858901-8a57-4791-81fe-4c455b099bc9",
+          "webhook_id": "3fa85f64-5717-4562-b3fc-2c963f66afa6",
+          "event_type": "order.created",
+          "attempt_number": 2,
+          "replay_number": 0,
+          "status": "failed_attempt",
+          "http_status": 503,
+          "error_details": "upstream returned 503",
+          "next_retry_at": "2026-06-21T10:05:00Z",
+          "in_dlq": false,
+          "created_at": "2026-06-21T10:00:00Z",
+          "updated_at": "2026-06-21T10:01:00Z"
+        }
+      },
+      "AttemptView": {
+        "type": "object",
+        "description": "A condensed view of a single delivery attempt, as used in webhook status history.",
+        "properties": {
+          "attempt_number": {
+            "type": "integer"
+          },
+          "replay_number": {
+            "type": "integer"
+          },
+          "status": {
+            "type": "string"
+          },
+          "http_status": {
+            "type": "integer"
+          },
+          "error_details": {
+            "type": "string"
+          },
+          "next_retry_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "timestamp": {
+            "type": "string",
+            "format": "date-time"
+          }
+        },
+        "required": [
+          "attempt_number",
+          "replay_number",
+          "status",
+          "timestamp"
+        ],
+        "example": {
+          "attempt_number": 1,
+          "replay_number": 0,
+          "status": "success",
+          "http_status": 200,
+          "timestamp": "2026-06-21T10:00:00Z"
+        }
+      },
+      "WebhookStatus": {
+        "type": "object",
+        "description": "Full status and attempt history for a single webhook.",
+        "properties": {
+          "webhook_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "subscription_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "event_type": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string"
+          },
+          "target_url": {
+            "type": "string"
+          },
+          "payload": {
+            "type": "object",
+            "additionalProperties": true
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "updated_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "last_attempt_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "next_retry_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "attempts": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/AttemptView"
+            }
+          },
+          "statistics": {
+            "type": "object",
+            "properties": {
+              "total_attempts": {
+                "type": "integer"
+              },
+              "successful": {
+                "type": "integer"
+              },
+              "failed": {
+                "type": "integer"
+              },
+              "pending": {
+                "type": "integer"
+              },
+              "final_failure": {
+                "type": "integer"
+              }
+            },
+            "required": [
+              "total_attempts",
+              "successful",
+              "failed",
+              "pending",
+              "final_failure"
+            ]
+          }
+        },
+        "required": [
+          "webhook_id",
+          "subscription_id",
+          "status",
+          "target_url",
+          "created_at",
+          "updated_at",
+          "last_attempt_at",
+          "attempts",
+          "statistics"
+        ]
+      }
+    }
+  },
+  "paths": {
+    "/health": {
+      "get": {
+        "summary": "Liveness check",
+        "description": "Liveness probe reporting the status of the service and its dependencies.",
+        "security": [],
+        "responses": {
+          "200": {
+            "description": "Service is alive.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "status": {
+                      "type": "string"
+                    },
+                    "checks": {
+                      "type": "object",
+                      "properties": {
+                        "database": {
+                          "type": "string"
+                        },
+                        "redis": {
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "database",
+                        "redis"
+                      ]
+                    }
+                  },
+                  "required": [
+                    "status",
+                    "checks"
+                  ]
+                },
+                "example": {
+                  "status": "ok",
+                  "checks": {
+                    "database": "ok",
+                    "redis": "ok"
+                  }
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Service is unhealthy.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "status": {
+                      "type": "string"
+                    },
+                    "checks": {
+                      "type": "object",
+                      "properties": {
+                        "database": {
+                          "type": "string"
+                        },
+                        "redis": {
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "database",
+                        "redis"
+                      ]
+                    }
+                  },
+                  "required": [
+                    "status",
+                    "checks"
+                  ]
+                },
+                "example": {
+                  "status": "unhealthy",
+                  "checks": {
+                    "database": "error",
+                    "redis": "ok"
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/ready": {
+      "get": {
+        "summary": "Readiness check",
+        "description": "Readiness probe reporting whether the service is ready to accept traffic.",
+        "security": [],
+        "responses": {
+          "200": {
+            "description": "Service is ready.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "status": {
+                      "type": "string"
+                    },
+                    "checks": {
+                      "type": "object",
+                      "properties": {
+                        "database": {
+                          "type": "string"
+                        },
+                        "redis": {
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "database",
+                        "redis"
+                      ]
+                    }
+                  },
+                  "required": [
+                    "status",
+                    "checks"
+                  ]
+                },
+                "example": {
+                  "status": "ready",
+                  "checks": {
+                    "database": "ok",
+                    "redis": "ok"
+                  }
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Service is not ready.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "status": {
+                      "type": "string"
+                    },
+                    "checks": {
+                      "type": "object",
+                      "properties": {
+                        "database": {
+                          "type": "string"
+                        },
+                        "redis": {
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "database",
+                        "redis"
+                      ]
+                    }
+                  },
+                  "required": [
+                    "status",
+                    "checks"
+                  ]
+                },
+                "example": {
+                  "status": "not_ready",
+                  "checks": {
+                    "database": "ok",
+                    "redis": "error"
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/openapi.json": {
+      "get": {
+        "summary": "Get OpenAPI specification",
+        "description": "Returns this OpenAPI specification document.",
+        "security": [],
+        "responses": {
+          "200": {
+            "description": "The OpenAPI specification.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/docs": {
+      "get": {
+        "summary": "Interactive API documentation",
+        "description": "Returns an interactive Swagger UI HTML page for exploring the API.",
+        "security": [],
+        "responses": {
+          "200": {
+            "description": "Swagger UI HTML page.",
+            "content": {
+              "text/html": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/ingest/{subscription_id}": {
+      "post": {
+        "summary": "Ingest a webhook",
+        "description": "Ingest a webhook payload for the given subscription. The request must be signed using the subscription's HMAC secret. Authentication is performed via the signature and timestamp headers, not via bearer auth.",
+        "security": [],
+        "parameters": [
+          {
+            "name": "subscription_id",
+            "in": "path",
+            "required": true,
+            "description": "The subscription receiving the webhook.",
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "X-Hub-Signature-256",
+            "in": "header",
+            "required": true,
+            "description": "HMAC-SHA256 signature of the raw request body in the form 'sha256=<hex>'.",
+            "schema": {
+              "type": "string"
+            },
+            "example": "sha256=2c9a...f7"
+          },
+          {
+            "name": "Webhook-Timestamp",
+            "in": "header",
+            "required": true,
+            "description": "Unix timestamp (seconds) when the request was signed. Used to reject requests outside the allowed clock drift window.",
+            "schema": {
+              "type": "string"
+            },
+            "example": "1750500000"
+          },
+          {
+            "name": "X-Idempotency-Key",
+            "in": "header",
+            "required": false,
+            "description": "Optional idempotency key used to deduplicate webhooks.",
+            "schema": {
+              "type": "string",
+              "pattern": "^[A-Za-z0-9_-]{1,128}$"
+            }
+          },
+          {
+            "name": "event_type",
+            "in": "query",
+            "required": false,
+            "description": "Optional event type for this webhook, used for event filtering.",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "description": "Arbitrary JSON object payload, maximum 64KB.",
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "additionalProperties": true,
+                "maxProperties": 10000
+              },
+              "example": {
+                "id": "evt_123",
+                "data": {
+                  "order_id": "ord_456",
+                  "amount": 1999
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "202": {
+            "description": "Webhook accepted and queued for delivery.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "webhook_id": {
+                      "type": "string",
+                      "format": "uuid"
+                    },
+                    "delivery_id": {
+                      "type": "string",
+                      "format": "uuid"
+                    },
+                    "status": {
+                      "type": "string",
+                      "enum": [
+                        "accepted"
+                      ]
+                    }
+                  },
+                  "required": [
+                    "webhook_id",
+                    "delivery_id",
+                    "status"
+                  ]
+                },
+                "example": {
+                  "webhook_id": "3fa85f64-5717-4562-b3fc-2c963f66afa6",
+                  "delivery_id": "7c9e6679-7425-40de-944b-e07fc1f90ae7",
+                  "status": "accepted"
+                }
+              }
+            }
+          },
+          "200": {
+            "description": "Webhook was a duplicate or was ignored (e.g. event type not subscribed).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "oneOf": [
+                    {
+                      "type": "object",
+                      "properties": {
+                        "webhook_id": {
+                          "type": "string",
+                          "format": "uuid"
+                        },
+                        "status": {
+                          "type": "string",
+                          "enum": [
+                            "duplicate"
+                          ]
+                        },
+                        "duplicate": {
+                          "type": "boolean",
+                          "enum": [
+                            true
+                          ]
+                        }
+                      },
+                      "required": [
+                        "webhook_id",
+                        "status",
+                        "duplicate"
+                      ]
+                    },
+                    {
+                      "type": "object",
+                      "properties": {
+                        "webhook_id": {
+                          "type": "string",
+                          "format": "uuid"
+                        },
+                        "status": {
+                          "type": "string",
+                          "enum": [
+                            "ignored"
+                          ]
+                        }
+                      },
+                      "required": [
+                        "webhook_id",
+                        "status"
+                      ]
+                    }
+                  ]
+                },
+                "examples": {
+                  "duplicate": {
+                    "summary": "Duplicate webhook",
+                    "value": {
+                      "webhook_id": "3fa85f64-5717-4562-b3fc-2c963f66afa6",
+                      "status": "duplicate",
+                      "duplicate": true
+                    }
+                  },
+                  "ignored": {
+                    "summary": "Ignored webhook",
+                    "value": {
+                      "webhook_id": "3fa85f64-5717-4562-b3fc-2c963f66afa6",
+                      "status": "ignored"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Missing or invalid headers, or timestamp outside the allowed drift window.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Invalid HMAC signature.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Subscription is inactive.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "Payload too large (exceeds 64KB).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Rate limited.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/subscriptions": {
+      "post": {
+        "summary": "Create a subscription",
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "target_url": {
+                    "type": "string",
+                    "description": "Destination URL. Must be https unless ALLOW_HTTP_URLS is enabled."
+                  },
+                  "event_types": {
+                    "type": "array",
+                    "items": {
+                      "type": "string"
+                    },
+                    "description": "Event types to subscribe to. Empty or omitted means all events."
+                  },
+                  "is_active": {
+                    "type": "boolean",
+                    "default": true
+                  }
+                },
+                "required": [
+                  "target_url"
+                ]
+              },
+              "example": {
+                "target_url": "https://example.com/webhooks",
+                "event_types": [
+                  "order.created"
+                ],
+                "is_active": true
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Subscription created. Includes the signing secret, shown only once.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SubscriptionWithSecret"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid request (e.g. missing or non-https target_url).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      },
+      "get": {
+        "summary": "List subscriptions",
+        "description": "List subscriptions using keyset (cursor) pagination.",
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "description": "Maximum number of items to return.",
+            "schema": {
+              "type": "integer",
+              "default": 20,
+              "maximum": 100,
+              "minimum": 1
+            }
+          },
+          {
+            "name": "cursor",
+            "in": "query",
+            "required": false,
+            "description": "Opaque cursor from a previous response's next_cursor.",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "A page of subscriptions.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "items": {
+                      "type": "array",
+                      "items": {
+                        "$ref": "#/components/schemas/Subscription"
+                      }
+                    },
+                    "next_cursor": {
+                      "type": [
+                        "string",
+                        "null"
+                      ],
+                      "description": "Cursor for the next page, or null if there are no more items."
+                    }
+                  },
+                  "required": [
+                    "items",
+                    "next_cursor"
+                  ]
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/subscriptions/{id}": {
+      "get": {
+        "summary": "Get a subscription",
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The subscription.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Subscription"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Subscription not found.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      },
+      "put": {
+        "summary": "Update a subscription",
+        "description": "Partially update a subscription. Only provided fields are changed.",
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "target_url": {
+                    "type": "string"
+                  },
+                  "event_types": {
+                    "type": "array",
+                    "items": {
+                      "type": "string"
+                    }
+                  },
+                  "is_active": {
+                    "type": "boolean"
+                  }
+                }
+              },
+              "example": {
+                "is_active": false
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "The updated subscription.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Subscription"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Subscription not found.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "summary": "Delete a subscription",
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Subscription deleted. No content."
+          },
+          "404": {
+            "description": "Subscription not found.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/subscriptions/{id}/attempts": {
+      "get": {
+        "summary": "List recent delivery attempts",
+        "description": "Return recent delivery attempts for a subscription.",
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "default": 50,
+              "maximum": 200,
+              "minimum": 1
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Recent attempts.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "items": {
+                      "type": "array",
+                      "items": {
+                        "$ref": "#/components/schemas/Attempt"
+                      }
+                    }
+                  },
+                  "required": [
+                    "items"
+                  ]
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Subscription not found.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/subscriptions/{id}/rotate-secret": {
+      "post": {
+        "summary": "Rotate signing secret",
+        "description": "Rotate the subscription's HMAC signing secret. The new secret is shown only once.",
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Secret rotated. Includes the new signing secret, shown only once.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SubscriptionWithSecret"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Subscription not found.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/subscriptions/{id}/replay/{webhook_id}": {
+      "post": {
+        "summary": "Replay a dead-lettered webhook",
+        "description": "Replay a webhook from the dead-letter queue as a new delivery chain.",
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "description": "The subscription that owns the webhook.",
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "webhook_id",
+            "in": "path",
+            "required": true,
+            "description": "The webhook to replay.",
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "202": {
+            "description": "Replay accepted; a new delivery chain has been created.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "webhook_id": {
+                      "type": "string",
+                      "format": "uuid"
+                    },
+                    "delivery_id": {
+                      "type": "string",
+                      "format": "uuid",
+                      "description": "The new delivery chain id."
+                    },
+                    "status": {
+                      "type": "string",
+                      "enum": [
+                        "replaying"
+                      ]
+                    }
+                  },
+                  "required": [
+                    "webhook_id",
+                    "delivery_id",
+                    "status"
+                  ]
+                },
+                "example": {
+                  "webhook_id": "3fa85f64-5717-4562-b3fc-2c963f66afa6",
+                  "delivery_id": "7c9e6679-7425-40de-944b-e07fc1f90ae7",
+                  "status": "replaying"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No dead-letter entry found for this webhook.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/subscriptions/{id}/dlq/{webhook_id}/ack": {
+      "post": {
+        "summary": "Acknowledge a dead-letter entry",
+        "description": "Discard / acknowledge a dead-letter queue entry so it is no longer pending.",
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "description": "The subscription that owns the webhook.",
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "webhook_id",
+            "in": "path",
+            "required": true,
+            "description": "The dead-lettered webhook to acknowledge.",
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Dead-letter entry acknowledged.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "webhook_id": {
+                      "type": "string",
+                      "format": "uuid"
+                    },
+                    "status": {
+                      "type": "string",
+                      "enum": [
+                        "acknowledged"
+                      ]
+                    }
+                  },
+                  "required": [
+                    "webhook_id",
+                    "status"
+                  ]
+                },
+                "example": {
+                  "webhook_id": "3fa85f64-5717-4562-b3fc-2c963f66afa6",
+                  "status": "acknowledged"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No dead-letter entry found for this webhook.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/status/{webhook_id}": {
+      "get": {
+        "summary": "Get webhook status",
+        "description": "Return the full attempt history and status for a webhook.",
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "webhook_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Webhook status and attempt history.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WebhookStatus"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Webhook not found.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/status/metrics/summary": {
+      "get": {
+        "summary": "Delivery metrics summary",
+        "description": "Aggregate delivery counts over a recent time window.",
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "hours",
+            "in": "query",
+            "required": false,
+            "description": "Size of the look-back window in hours.",
+            "schema": {
+              "type": "integer",
+              "default": 24,
+              "minimum": 1
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Aggregate delivery metrics.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "window_hours": {
+                      "type": "integer"
+                    },
+                    "total_attempts": {
+                      "type": "integer"
+                    },
+                    "successful": {
+                      "type": "integer"
+                    },
+                    "failed": {
+                      "type": "integer"
+                    },
+                    "pending": {
+                      "type": "integer"
+                    },
+                    "final_failure": {
+                      "type": "integer"
+                    },
+                    "success_rate": {
+                      "type": "number"
+                    }
+                  },
+                  "required": [
+                    "window_hours",
+                    "total_attempts",
+                    "successful",
+                    "failed",
+                    "pending",
+                    "final_failure",
+                    "success_rate"
+                  ]
+                },
+                "example": {
+                  "window_hours": 24,
+                  "total_attempts": 1200,
+                  "successful": 1150,
+                  "failed": 40,
+                  "pending": 5,
+                  "final_failure": 5,
+                  "success_rate": 0.958
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/monitor": {
+      "get": {
+        "summary": "System health and metrics",
+        "description": "Return system-level health, queue depths, circuit breaker states, and delivery latency metrics.",
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "System monitoring snapshot.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "uptime_seconds": {
+                      "type": "integer"
+                    },
+                    "current_time": {
+                      "type": "string"
+                    },
+                    "delivery_metrics": {
+                      "type": "object",
+                      "description": "Counts keyed by delivery status, including a 'total' key.",
+                      "additionalProperties": {
+                        "type": "integer"
+                      }
+                    },
+                    "queue_depth": {
+                      "type": "integer"
+                    },
+                    "dead_letter_queue_depth": {
+                      "type": "integer"
+                    },
+                    "circuit_breakers": {
+                      "type": "object",
+                      "description": "Circuit breaker state keyed by target URL.",
+                      "additionalProperties": {
+                        "type": "string"
+                      }
+                    },
+                    "delivery_latency_ms": {
+                      "type": "object",
+                      "properties": {
+                        "count": {
+                          "type": "integer"
+                        },
+                        "min": {
+                          "type": "integer"
+                        },
+                        "max": {
+                          "type": "integer"
+                        },
+                        "avg": {
+                          "type": "integer"
+                        },
+                        "p50": {
+                          "type": "integer"
+                        },
+                        "p95": {
+                          "type": "integer"
+                        },
+                        "p99": {
+                          "type": "integer"
+                        }
+                      },
+                      "required": [
+                        "count",
+                        "min",
+                        "max",
+                        "avg",
+                        "p50",
+                        "p95",
+                        "p99"
+                      ]
+                    }
+                  },
+                  "required": [
+                    "uptime_seconds",
+                    "current_time",
+                    "delivery_metrics",
+                    "queue_depth",
+                    "dead_letter_queue_depth",
+                    "circuit_breakers",
+                    "delivery_latency_ms"
+                  ]
+                },
+                "example": {
+                  "uptime_seconds": 86400,
+                  "current_time": "2026-06-21T10:00:00Z",
+                  "delivery_metrics": {
+                    "total": 1200,
+                    "success": 1150,
+                    "failed": 40,
+                    "pending": 10
+                  },
+                  "queue_depth": 3,
+                  "dead_letter_queue_depth": 1,
+                  "circuit_breakers": {
+                    "https://example.com/webhooks": "closed"
+                  },
+                  "delivery_latency_ms": {
+                    "count": 1200,
+                    "min": 12,
+                    "max": 980,
+                    "avg": 85,
+                    "p50": 70,
+                    "p95": 240,
+                    "p99": 600
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
