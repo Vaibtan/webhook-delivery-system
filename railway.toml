@@ -1,0 +1,14 @@
+# Railway deployment for the Go webhook delivery system.
+# Uses the root Dockerfile (multi-stage → distroless). Migrations run embedded on
+# startup. Provision Postgres + Redis plugins and set DATABASE_URL, REDIS_URL,
+# and ADMIN_API_KEY in the service variables. Railway injects PORT.
+
+[build]
+builder = "DOCKERFILE"
+dockerfilePath = "Dockerfile"
+
+[deploy]
+healthcheckPath = "/api/v1/health"
+healthcheckTimeout = 300
+restartPolicyType = "ON_FAILURE"
+restartPolicyMaxRetries = 5
