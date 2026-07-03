@@ -1,0 +1,32 @@
+# Keep the Docker build context small: only go.mod/sum + cmd/internal/migrations
+# are needed (the Dockerfile COPYs those explicitly). Exclude everything heavy or
+# Python-specific.
+.git
+.github
+.agents
+.claude
+bin/
+*.exe
+
+# Python reference project (not part of the Go build)
+app/
+alembic/
+tests/
+static/
+docs/
+*.py
+*.pyc
+__pycache__/
+requirements.txt
+pyproject.toml
+pytest.ini
+alembic.ini
+runtime.txt
+dump.rdb
+
+# Local env / editor
+.env
+.env.*
+.vscode/
+.idea/
+*.log
