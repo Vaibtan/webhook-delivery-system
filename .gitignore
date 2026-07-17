@@ -1,9 +1,8 @@
 .claude/
 .agents/
+/codex/
 skills-lock.json
 dump.rdb
-
-# Internal working artifacts (not for the published portfolio repo).
 assignment.txt
 docs/.adversarial-review-*.md
 __pycache__/

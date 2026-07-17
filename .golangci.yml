@@ -1,14 +1,10 @@
-# golangci-lint v2 configuration.
 version: "2"
-
 run:
   timeout: 5m
   build-tags:
     - integration
-
 linters:
-  # The standard set (errcheck, govet, ineffassign, staticcheck, unused) plus a
-  # few high-signal additions.
+  # The standard set (errcheck, govet, ineffassign, staticcheck, unused) plus few high-signal additions.
   default: standard
   enable:
     - bodyclose   # response bodies must be closed
@@ -25,7 +21,6 @@ linters:
           - errcheck
           - bodyclose
           - noctx
-
 formatters:
   enable:
     - gofmt
