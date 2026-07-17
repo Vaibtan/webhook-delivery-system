@@ -1,7 +1,7 @@
 # Go Webhook Delivery System — Implementation Plan (v4)
 
 A production-grade, portfolio-quality port of the Python webhook delivery service to Go, incorporating all fixes from the plan review.
-**Locked decisions**: Go 1.26.2 · 3 third-party runtime packages + `golang.org/x/sync` (Go-team extended stdlib, for `errgroup`); `testify` test-only · Redis sorted-set retry scheduler with atomic Lua scheduling · circuit breaker + rate limiter + secret rotation + advanced safety features (SSRF protection, DLQ, replay API, concurrency limits).
+**Locked decisions**: Go 1.26 · 3 third-party runtime packages + `golang.org/x/sync` (Go-team extended stdlib, for `errgroup`); `testify` test-only · Redis sorted-set retry scheduler with atomic Lua scheduling · circuit breaker + rate limiter + secret rotation + advanced safety features (SSRF protection, DLQ, replay API, concurrency limits).
 
 > [!IMPORTANT]
 > **v4 review-driven decisions (ground truth checked against the Python `app/` source):**
@@ -149,7 +149,7 @@ webhook-delivery-system/                # module github.com/Vaibtan/webhook-deli
 │   │   ├── handler_ingest.go         # POST /ingest/{id} — size validation, is_active check, sig verify, event filter, enqueue
 │   │   ├── handler_status.go         # GET /status/{webhook_id}, GET /status/metrics/summary
 │   │   ├── handler_health.go         # GET /health, GET /ready
-│   │   ├── handler_docs.go           # GET /docs (interactive Swagger UI) + /openapi.json (embed.FS spec)
+│   │   ├── handler_docs.go           # GET /docs (interactive Swagger UI) + /openapi.json (//go:embed spec)
 │   │   └── handler_monitor.go        # GET /monitor — detailed JSON metrics & latency
 │   │
 │   ├── store/
@@ -176,10 +176,8 @@ webhook-delivery-system/                # module github.com/Vaibtan/webhook-deli
 │   └── worker/
 │       ├── pool.go                   # Goroutine pool, errgroup, graceful stop, BRPOP timeout
 │       ├── delivery.go               # HTTP delivery: re-check is_active → sign → check CB/RL/SSRF → send → drain
-│       ├── retry_scheduler.go        # Goroutine: polls sorted set with Lua, re-enqueues
-│       ├── recovery.go               # Goroutine: startup + periodic scan for orphaned tasks
-│       ├── cleanup.go                # Ticker: the only retention-driven deleter — DELETE … WHERE created_at < threshold AND NOT in_dlq AND status <> 'pending' (+ prunes ingest_idempotency); the lone exception is the explicit subscription-delete cascade
-│       └── dlq_reconciler.go         # Ticker: LIST↔in_dlq reconciliation + DLQ_MAX_AGE force-ack (mutates flag only, no deletes)
+│       ├── retry.go                  # retryDelay backoff + RetrySchedulerWorker (polls sorted set with Lua, re-enqueues) + RecoveryWorker (startup + periodic scan for orphaned tasks)
+│       └── cleanup.go                # CleanupWorker (Ticker): the only retention-driven deleter — DELETE … WHERE created_at < threshold AND NOT in_dlq AND status <> 'pending' (+ prunes ingest_idempotency); the lone exception is the explicit subscription-delete cascade. Also DLQReconciler (Ticker): LIST↔in_dlq reconciliation + DLQ_MAX_AGE force-ack (mutates flag only, no deletes)
 │
 ├── migrations/
 │   ├── 000001_initial_schema.up.sql  # Consolidated schema: subscriptions (with rotation) + delivery_logs
@@ -188,9 +186,9 @@ webhook-delivery-system/                # module github.com/Vaibtan/webhook-deli
 │   └── 000002_indexes.down.sql
 │
 ├── docker/
-│   ├── Dockerfile                    # Multi-stage: builder + distroless static runner
 │   └── docker-compose.yml            # postgres + redis (with AOF persistence)
 │
+├── Dockerfile                        # Multi-stage: builder + distroless static runner (repo root — Railway auto-detect)
 ├── .golangci.yml
 ├── Makefile                          # run, test, lint, migrate-up, migrate-down
 ├── go.mod                            # module github.com/Vaibtan/webhook-delivery-system
@@ -320,7 +318,7 @@ return #tasks
 
 **Implementation in the Scheduler**:
 ```go
-// internal/worker/retry_scheduler.go
+// internal/infra/scheduler/redis_scheduler.go
 var claimDueScript = redis.NewScript(`
     local tasks = redis.call('ZRANGEBYSCORE', KEYS[1], '0', ARGV[1], 'LIMIT', 0, 100)
     for _, task in ipairs(tasks) do
@@ -331,7 +329,7 @@ var claimDueScript = redis.NewScript(`
 `)
 
 func (s *RetryScheduler) processDue(ctx context.Context) {
-    now := strconv.FormatFloat(float64(time.Now().Unix()), 'f', 0, 64)
+    now := strconv.FormatFloat(float64(time.Now().UnixMilli())/1000.0, 'f', 3, 64)
     keys := []string{"webhook:retry:schedule", "webhook:queue"}
     
     count, err := claimDueScript.Run(ctx, s.redis, keys, now).Int()
@@ -470,15 +468,21 @@ A `sync.Map` of `*TokenBucket` keyed by subscription id holds the buckets. Memor
 `retryDelay(attempt)` takes the attempt number that **just failed** (`1..4`) and returns the delay before the next attempt. With 5 total attempts the delays actually exercised are `retryDelay(1..4) = 10s, 30s, 90s, 270s`. The 15-minute cap is a guard for `RETRY_DELAYS`-style config overrides, not hit by the default curve.
 
 ```go
-// internal/worker/delivery.go — uses math/rand/v2 (rand.Int64N), Go 1.22+
-func retryDelay(attempt int) time.Duration {
-    base := 10 * time.Second
-    delay := base * time.Duration(math.Pow(3, float64(attempt-1))) // 10,30,90,270,810…
-    if delay > 15*time.Minute {
-        delay = 15 * time.Minute // cap (guard for config overrides)
+// internal/worker/retry.go — uses math/rand/v2 (rand.Int64N), Go 1.22+
+// base/max come from RETRY_BASE_DELAY / RETRY_MAX_DELAY (defaults 10s / 15m).
+func retryDelay(attempt int, base, max time.Duration) time.Duration {
+    if base <= 0 {
+        base = 10 * time.Second
+    }
+    delay := time.Duration(float64(base) * math.Pow(3, float64(attempt-1))) // 10,30,90,270,810…
+    if max > 0 && delay > max {
+        delay = max // cap (guard for config overrides)
     }
     // ±20% jitter
     jitter := delay / 5
+    if jitter <= 0 {
+        return delay
+    }
     return delay - jitter + time.Duration(rand.Int64N(int64(2*jitter)))
 }
 ```
@@ -773,8 +777,9 @@ All API endpoints are versioned under prefix `/api/v1`.
 | `GET` | `/api/v1/health` | Liveness probe (ping DB & Redis) | — |
 | `GET` | `/api/v1/ready` | Readiness probe (workers running?) | **NEW** |
 | `GET` | `/api/v1/monitor` | System health, queue depths, CB states, & latency distributions | Enhanced |
-| `GET` | `/api/v1/openapi.json` | Serves the generated OpenAPI 3.1 spec (hand-authored, served via `embed.FS`) | **NEW** |
+| `GET` | `/api/v1/openapi.json` | Serves the generated OpenAPI 3.1 spec (hand-authored, embedded via `//go:embed`) | **NEW** |
 | `GET` | `/api/v1/docs` | Serves an **interactive Swagger UI** (static HTML loading swagger-ui from CDN, pointed at `/api/v1/openapi.json`) — satisfies the assignment's "minimal UI" requirement. Raw JSON alone is *not* a UI | **NEW** |
+| `GET` | `/api/v1/debug/vars` | expvar runtime variables (admin auth) | **NEW** |
 | `GET` | `/api/v1/debug/pprof/` | Profiling handler (gated by `ENABLE_PPROF=true`) | **NEW** |
 
 ### `/api/v1/monitor` JSON Response Shape:
@@ -859,7 +864,7 @@ When a webhook reaches `final_failure` (the 5th and last attempt failed — see 
 
 **Separation of concerns (two goroutines).** All of this is split so that exactly one component deletes rows:
 - **`cleanup.go`** is the *only* deleter: `DELETE … WHERE created_at < threshold AND NOT in_dlq AND status <> 'pending'` (never reaps undelivered work). It also prunes `ingest_idempotency` rows older than `IDEMPOTENCY_TTL` — the only other table it touches, and still the sole deletion path, so the "one deleter" invariant holds. (The one deletion *outside* `cleanup.go` is the explicit operator-initiated subscription delete, which `ON DELETE CASCADE`s — see the Delivery Guarantee Statement.)
-- **`dlq_reconciler.go`** never deletes — it only mutates the `in_dlq` flag and syncs the Redis LIST:
+- **`DLQReconciler`** (in `cleanup.go`) never deletes — it only mutates the `in_dlq` flag and syncs the Redis LIST:
   - **Reconciliation (flag is authoritative):** the LIST and flag can momentarily disagree (e.g. a crash between `LPUSH` and commit, or a lost post-ack `LREM`). The reconciler re-`LPUSH`es ids of rows where `in_dlq = TRUE` but absent from the LIST, and `LREM`s any LIST id whose row **fails `WHERE id=$1 AND in_dlq = TRUE`** — i.e. the row is gone *or* it is still present but already acked (`in_dlq = FALSE`). Checking only "row is gone" would leave an acked-but-not-`LREM`'d entry visible in the LIST and in `dead_letter_queue_depth` until retention finally deleted the row, and a replay/ack on it would `404` for an entry operators can still see. Same "DB is source of truth" principle as orphan recovery (§1).
   - **`DLQ_MAX_AGE` safety valve (default 30d):** for `in_dlq` entries older than the limit that no operator ever acked, the reconciler **force-acks** them (`in_dlq = FALSE` + `LREM` + a logged warning). It does *not* delete — the next `cleanup` cycle then reaps them via its `AND NOT in_dlq` predicate. This keeps every row deletion in one place.
 
@@ -954,15 +959,15 @@ The following patterns were evaluated during design and are documented here for 
 - `internal/infra/scheduler` — Redis ZSET retry scheduler (Lua script claims)
 - `internal/infra/cache` — subscription read-through cache
 - `internal/worker/pool` + `internal/worker/delivery` — end-to-end delivery with response body drain
-- `internal/worker/retry_scheduler` — scheduler goroutine with Lua script polling
-- `internal/worker/recovery` — orphaned task recovery goroutine
+- `internal/worker/retry` (RetrySchedulerWorker) — scheduler goroutine with Lua script polling
+- `internal/worker/retry` (RecoveryWorker) — orphaned task recovery goroutine
 - `internal/worker/cleanup` — retention ticker (sole retention-driven row deleter; also prunes `ingest_idempotency`; the one deletion outside it is the explicit subscription-delete cascade)
-- `internal/worker/dlq_reconciler` — DLQ LIST↔`in_dlq` reconciliation + `DLQ_MAX_AGE` force-ack (added in Phase 4 once the DLQ exists; scaffolded here)
+- `internal/worker/cleanup` (DLQReconciler) — DLQ LIST↔`in_dlq` reconciliation + `DLQ_MAX_AGE` force-ack (added in Phase 4 once the DLQ exists; scaffolded here)
 
 ### Phase 3 — API Layer
 - `internal/api/server` — ServeMux with CORS middleware (correct constraints: no `*` origin with `allow_credentials`, unlike the Python `main.py`), v1 prefix
 - All handlers: subscription CRUD (keyset list returning `{items, next_cursor}`), ingest (signature **+ `Webhook-Timestamp`**, `is_active`, rate-limit, 64KB cap, event filter), status (**aggregates all attempt rows by `webhook_id`** → `attempts[]` + `statistics`, §0), `/metrics/summary`, health, ready, monitor
-- `internal/api/handler_docs` — **interactive Swagger UI** at `/docs` + `embed.FS` OpenAPI 3.1 spec at `/openapi.json`
+- `internal/api/handler_docs` — **interactive Swagger UI** at `/docs` + `//go:embed` OpenAPI 3.1 spec at `/openapi.json`
 
 ### Phase 4 — Advanced Features
 - `internal/infra/breaker` — circuit breaker with probing flag + integration with deliverer
@@ -970,7 +975,7 @@ The following patterns were evaluated during design and are documented here for 
 - Secret rotation endpoint + dual-secret & timestamp verification logic + **cache eviction on rotate**
 - Auto-disable: `consecutive_failures` increment/reset (transactional) + `is_active=false` at threshold + cache eviction
 - DLQ: `in_dlq` flag set transactionally on `final_failure` + `LPUSH`; replay & ack endpoints clear the flag (`LREM`); **ACK-gated cleanup** in `cleanup.go` (`... AND NOT in_dlq`)
-- `internal/worker/dlq_reconciler` — dedicated goroutine: LIST↔`in_dlq` reconciliation + `DLQ_MAX_AGE` force-ack (flag-only, no deletes — keeps `cleanup.go` the sole retention-driven deleter)
+- `internal/worker/cleanup` (DLQReconciler) — dedicated goroutine: LIST↔`in_dlq` reconciliation + `DLQ_MAX_AGE` force-ack (flag-only, no deletes — keeps `cleanup.go` the sole retention-driven deleter)
 - Per-subscription concurrency limits in worker delivery
 - `pprof` endpoint (env-gated)
 

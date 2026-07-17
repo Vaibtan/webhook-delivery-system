@@ -232,7 +232,7 @@ All endpoints are versioned under `/api/v1`. Paths below match `internal/api/ser
 |---|---|---|---|
 | `GET` | `/api/v1/health` | Public | Liveness probe (pings DB & Redis). |
 | `GET` | `/api/v1/ready` | Public | Readiness probe (worker pool running?). |
-| `GET` | `/api/v1/openapi.json` | Public | OpenAPI 3.1 spec (served via `embed.FS`). |
+| `GET` | `/api/v1/openapi.json` | Public | OpenAPI 3.1 spec (embedded via `//go:embed`). |
 | `GET` | `/api/v1/docs` | Public | **Interactive Swagger UI** (loads swagger-ui from CDN against `/openapi.json`). |
 | `POST` | `/api/v1/ingest/{id}` | HMAC | Ingest a payload for subscription `{id}`. Requires `X-Hub-Signature-256` + `Webhook-Timestamp`; checks `is_active` + rate limit; event-type filter; body capped at 64 KB. |
 | `POST` | `/api/v1/subscriptions` | Admin | Create a subscription (HTTPS target required unless `ALLOW_HTTP_URLS=true`). |

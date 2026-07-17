@@ -14,7 +14,7 @@ human (decision, credentials, or a live deploy).
 
 ## Standing invariants (apply to every slice — never violate)
 
-- [x] **Runtime deps**: 3 third-party packages (`pgx/v5`, `golang-migrate`, `go-redis/v9`) **+ `golang.org/x/sync`** (Go-team extended stdlib, for `errgroup`). `testify` is test-only. Nothing else ships in the binary. _(go.mod direct requires = exactly those 3; migrate uses its pgx/v5 driver so no lib/pq; binary import graph verified clean.)_
+- [x] **Runtime deps**: 3 third-party packages (`pgx/v5`, `golang-migrate`, `go-redis/v9`) **+ `golang.org/x/sync`** (Go-team extended stdlib, for `errgroup`). `testify` is test-only. Nothing else ships in the binary. _(go.mod direct requires = those 3 + `golang.org/x/sync` (test-only `testify` aside); migrate uses its pgx/v5 driver so no lib/pq; binary import graph verified clean.)_
 - [x] **`internal/domain` has zero non-stdlib imports** (the dependency rule — arrows point inward). _(domain imports only fmt/net/url/strings/time/context/encoding/json/errors.)_
 - [x] **One row per delivery attempt** (plan §0): `delivery_logs.id` = `X-Webhook-Delivery-ID`; `webhook_id` = `X-Webhook-ID` (stable). `attempt_number` is per-chain; `replay_number` identifies the chain (current chain = `MAX(replay_number)`). `(webhook_id, attempt_number)` is **non-unique**; never mutate `attempt_number` in place.
 - [x] **CAS + single-txn + visibility-lease lifecycle** (plan §0/§1): every status change is `UPDATE … WHERE id=$1 AND status='pending'` (0 rows ⇒ abort). The `failed_attempt` update + `pending` successor INSERT are **one DB transaction**. A worker **claims** a pending row with a conditional CAS — `next_retry_at = now()+VISIBILITY_TIMEOUT WHERE id=$1 AND status='pending' AND next_retry_at <= now()` (the `<= now()` predicate makes the claim the mutual-exclusion point; 0 rows ⇒ not due / lease live / already handled ⇒ duplicate dequeue, skip); recovery reclaims `pending AND next_retry_at <= now()`. Redis `ZADD`/`LPUSH` happen **after commit** (Postgres is source of truth; recovery + reconciler heal lost post-commit ops).
@@ -52,7 +52,7 @@ human (decision, credentials, or a live deploy).
 
 The empty-but-running skeleton: config → store → migrations → health endpoint → `main.go` wiring. Proves the whole stack boots and talks to Postgres + Redis.
 
-- [x] **Module path confirmed** with the user: `github.com/Vaibtan/webhook-delivery-system` → `go.mod` (Go 1.26.2).
+- [x] **Module path confirmed** with the user: `github.com/Vaibtan/webhook-delivery-system` → `go.mod` (Go 1.26).
 - [x] Hexagonal scaffold per the plan's directory tree: `cmd/server`, `internal/{config,domain,api,store,infra/*,worker}`. _(api/store/config/domain created; infra/* + worker created per-slice as they're built.)_
 - [x] `internal/config`: typed `Config` from `os.Getenv`, matching the plan's **Configuration** table exactly (incl. `ADMIN_API_KEY`, `VISIBILITY_TIMEOUT`, `IDEMPOTENCY_TTL`, `ORPHAN_THRESHOLD`).
 - [x] `internal/domain`: `Subscription`, `DeliveryLog` (incl. `replay_number`), `DeliveryStatus` enum, repository + service ports, sentinel errors. _(ports grow per slice.)_
@@ -113,7 +113,7 @@ The keystone slice — proves the whole webhook concept end-to-end **synchronous
 
 **Retry scheduler:**
 - [x] `infra/scheduler`: `ZADD webhook:retry:schedule`; atomic Lua claim script (`ZRANGEBYSCORE` + `ZREM` + `LPUSH`, `LIMIT 0 100`). _(sub-second float scores — integer `Unix()` truncation moved rows ~1s early and the claim predicate then rejected them, stalling retries until recovery; fixed.)_
-- [x] `worker/retry_scheduler` goroutine polls due entries via the Lua script and re-enqueues. _(1s tick.)_
+- [x] `worker/retry` (RetrySchedulerWorker) goroutine polls due entries via the Lua script and re-enqueues. _(1s tick.)_
 - [x] `retryDelay(attempt)`: `RETRY_BASE_DELAY` × 3^(n-1), ±20% jitter (`math/rand/v2`), `RETRY_MAX_DELAY` cap. Default 10/30/90/270s.
 - [x] Failure lifecycle is **one DB transaction**: CAS prev row → `failed_attempt` (0 rows ⇒ abort), INSERT new `pending` row (`attempt+1`, `next_retry_at`), COMMIT, **then** `ZADD` the new row's id (post-commit). _(FailAndScheduleRetry + INSERT…SELECT successor.)_
 - [x] **5 total attempts** (1 + 4) then `final_failure`. _(verified: 4 failed_attempt + final_failure.)_
@@ -132,7 +132,7 @@ The keystone slice — proves the whole webhook concept end-to-end **synchronous
 - [x] `POST /api/v1/subscriptions/{id}/replay/{webhook_id}` (admin auth): in the claim's txn, insert a fresh `pending` row **starting a new chain** (`replay_number = claimed+1`, `attempt_number = 1`, `next_retry_at = now()`) under the same `webhook_id`; after commit enqueue + `LREM`. _(verified: new chain replay_number=1, old LREM'd.)_
 - [x] `POST /api/v1/subscriptions/{id}/dlq/{webhook_id}/ack` (admin auth): the atomic claim *is* the ack; after commit `LREM`; 404 if already reaped. _(verified: 200 then 404.)_
 - [x] `worker/cleanup`: **sole retention-driven row deleter** (also prunes `ingest_idempotency` past `IDEMPOTENCY_TTL`; the lone exception is the explicit subscription-delete cascade) — `DELETE … WHERE created_at < retention AND NOT in_dlq AND status <> 'pending'`. _(never-deletes-pending is a Slice 11 high-risk integration test.)_
-- [x] `worker/dlq_reconciler` (flag-only, no deletes): re-`LPUSH` `in_dlq=TRUE` rows missing from LIST; `LREM` any LIST id failing `WHERE id=$1 AND in_dlq=TRUE` (row gone **or** already acked); `DLQ_MAX_AGE` force-ack with logged warning. _(verified: bogus LIST id healed.)_
+- [x] `worker/cleanup` (DLQReconciler, flag-only, no deletes): re-`LPUSH` `in_dlq=TRUE` rows missing from LIST; `LREM` any LIST id failing `WHERE id=$1 AND in_dlq=TRUE` (row gone **or** already acked); `DLQ_MAX_AGE` force-ack with logged warning. _(verified: bogus LIST id healed.)_
 - [x] **Verify:** `final_failure` → DLQ; replay starts a new chain (attempt 1) + clears flag; concurrent replays produce exactly one new chain; ack clears flag; reconciler heals a manual LIST↔flag divergence. _(all verified; cleanup-never-pending → Slice 11.)_
 
 ## Slice 7 — Resilience: circuit breaker + rate limiter + per-sub concurrency  `AFK`
@@ -183,7 +183,7 @@ The keystone slice — proves the whole webhook concept end-to-end **synchronous
 ## Slice 10 — OpenAPI 3.1 spec + interactive Swagger UI  `AFK`
 **Blocked by:** 8 · **Plan refs:** Phase 3, API surface
 
-- [x] Hand-authored OpenAPI 3.1 spec served via `embed.FS` at `GET /api/v1/openapi.json` (public). _(46KB, 14 paths/17 ops, embedded via //go:embed; Subscription schema secret-redacted.)_
+- [x] Hand-authored OpenAPI 3.1 spec served at `GET /api/v1/openapi.json` (public). _(46KB, 14 paths/17 ops, embedded via //go:embed; Subscription schema secret-redacted.)_
 - [x] `GET /api/v1/docs` — interactive Swagger UI (CDN swagger-ui pointed at the spec). _(swagger-ui-dist@5; verified loads, public.)_
 - [x] Spec covers every `/api/v1` endpoint + the `Webhook-Timestamp` / optional `X-Idempotency-Key` headers, the `Bearer` admin scheme, rotate/replay/ack, and cursor params. _(all present; bearerAuth scheme + HMAC header params.)_
 
