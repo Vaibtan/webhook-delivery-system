@@ -65,8 +65,8 @@ func (r *DeliveryLogRepo) GetByID(ctx context.Context, id string) (*domain.Deliv
 	return d, nil
 }
 
-// ListByWebhookID returns all attempt rows for a webhook, ordered by
-// (replay_number, attempt_number) — the status-endpoint order (§0).
+// ListByWebhookID returns all attempt rows for a webhook in status-endpoint
+// order: replay_number, then attempt_number.
 func (r *DeliveryLogRepo) ListByWebhookID(ctx context.Context, webhookID string) ([]*domain.DeliveryLog, error) {
 	q := `SELECT ` + dlColumns + ` FROM delivery_logs WHERE webhook_id = $1
 		ORDER BY replay_number ASC, attempt_number ASC`

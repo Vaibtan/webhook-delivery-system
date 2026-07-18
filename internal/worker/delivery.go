@@ -123,10 +123,9 @@ func NewDeliverer(logs deliveryStore, subs subscriptionState, sched deliverySche
 
 var _ domain.Deliverer = (*Deliverer)(nil)
 
-// Process delivers the attempt identified by deliveryLogID. Per §1 rule 1 it
-// returns a non-nil error ONLY for unexpected infrastructure failures; ordinary
-// delivery failures are persisted (CAS) and reported as nil so they never tear
-// down the worker pool.
+// Process delivers the attempt identified by deliveryLogID. It returns a
+// non-nil error only for unexpected infrastructure failures; ordinary delivery
+// failures are persisted and reported as nil so they never tear down the pool.
 func (d *Deliverer) Process(ctx context.Context, deliveryLogID string) error {
 	log, err := d.logs.GetByID(ctx, deliveryLogID)
 	if err != nil {

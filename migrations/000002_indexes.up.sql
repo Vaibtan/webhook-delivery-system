@@ -1,7 +1,7 @@
 -- Keyset pagination for GET /subscriptions (ORDER BY created_at DESC, id DESC):
 CREATE INDEX idx_sub_created_id ON subscriptions (created_at DESC, id DESC);
 
--- Status endpoint orders all attempts of a webhook by (replay_number, attempt_number) (§0).
+-- Status endpoint orders all attempts by (replay_number, attempt_number).
 -- The column order matches that sort so the query needs no extra in-memory ordering.
 -- Intentionally NON-UNIQUE: a replay restarts the attempt chain, so the tuple repeats.
 CREATE INDEX idx_dl_webhook_attempt ON delivery_logs (webhook_id, replay_number, attempt_number);

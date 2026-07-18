@@ -1,6 +1,5 @@
--- Initial consolidated schema for the Go webhook delivery system.
--- The unused Python `webhooks` table is dropped: webhook IDs are minted
--- dynamically at ingestion. gen_random_uuid() is built into Postgres core (>= 13).
+-- Initial schema for the webhook delivery system. Webhook IDs are minted at
+-- ingestion; gen_random_uuid() is built into Postgres core (>= 13).
 
 CREATE TYPE delivery_status AS ENUM (
     'pending', 'success', 'failed_attempt', 'final_failure'
@@ -8,13 +7,13 @@ CREATE TYPE delivery_status AS ENUM (
 
 CREATE TABLE subscriptions (
     id                   UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    target_url           VARCHAR(2048) NOT NULL,                  -- widened from Python's VARCHAR(255)
+    target_url           VARCHAR(2048) NOT NULL,
     secret_key           VARCHAR(255)  NOT NULL,
-    previous_secret_key  VARCHAR(255),                            -- NEW: dual-secret rotation key
-    secret_rotated_at    TIMESTAMPTZ,                             -- NEW: grace-period start
+    previous_secret_key  VARCHAR(255),                            -- dual-secret rotation key
+    secret_rotated_at    TIMESTAMPTZ,                             -- grace-period start
     event_types          TEXT[]        NOT NULL DEFAULT '{}',
-    is_active            BOOLEAN       NOT NULL DEFAULT TRUE,     -- NEW (Python has no is_active)
-    consecutive_failures INT           NOT NULL DEFAULT 0,        -- NEW: drives auto-disable
+    is_active            BOOLEAN       NOT NULL DEFAULT TRUE,
+    consecutive_failures INT           NOT NULL DEFAULT 0,        -- drives auto-disable
     created_at           TIMESTAMPTZ   NOT NULL DEFAULT NOW(),
     updated_at           TIMESTAMPTZ   NOT NULL DEFAULT NOW()
 );

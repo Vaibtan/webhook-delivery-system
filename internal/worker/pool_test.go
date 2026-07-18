@@ -69,7 +69,7 @@ func TestPoolProcessesAllTasks(t *testing.T) {
 	assert.False(t, pool.Running())
 }
 
-// A delivery that returns a non-nil error must NOT tear down the pool (§1 rule 1).
+// A delivery that returns a non-nil error must not tear down the pool.
 func TestPoolDeliveryErrorDoesNotTearDownPool(t *testing.T) {
 	q := &fakeQueue{items: []string{"ok1", "boom", "ok2", "ok3"}}
 	var processed atomic.Int32
@@ -93,8 +93,8 @@ func TestPoolDeliveryErrorDoesNotTearDownPool(t *testing.T) {
 	require.NoError(t, <-done)
 }
 
-// An in-flight delivery must finish after ctx is cancelled (graceful drain, §1
-// rule 2: context.WithoutCancel + drain deadline).
+// An in-flight delivery must finish after ctx is cancelled because its drain
+// context survives cancellation and retains a deadline.
 func TestPoolDrainsInFlightOnCancel(t *testing.T) {
 	q := &fakeQueue{items: []string{"slow"}}
 	started := make(chan struct{})

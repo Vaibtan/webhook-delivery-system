@@ -10,7 +10,7 @@ type DeliveryStatus string
 
 const (
 	// StatusPending — created, not yet finalized. Undelivered work; the
-	// retention cleanup must never reap a pending row (§ Advanced Features 1).
+	// retention cleanup must never reap a pending row.
 	StatusPending DeliveryStatus = "pending"
 	// StatusSuccess — the target returned 2xx.
 	StatusSuccess DeliveryStatus = "success"
@@ -21,7 +21,8 @@ const (
 	StatusFinalFailure DeliveryStatus = "final_failure"
 )
 
-// DeliveryLog is one immutable delivery attempt.
+// DeliveryLog is one delivery attempt. Retry successors use new rows; status,
+// lease, and outcome fields on this row change as the attempt is processed.
 //
 //   - ID         = X-Webhook-Delivery-ID, unique per attempt.
 //   - WebhookID   = X-Webhook-ID, stable across all attempts of one ingested event.

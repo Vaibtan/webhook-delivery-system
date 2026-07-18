@@ -150,7 +150,7 @@ func (r *DeliveryLogRepo) MarkSuccess(ctx context.Context, id, subscriptionID st
 // FinalizeFailure CAS-transitions the row to final_failure + in_dlq=TRUE and increments
 // the subscription's consecutive_failures, auto-disabling it (is_active=FALSE) at
 // disableThreshold. Returns won (CAS succeeded → caller LPUSHes the DLQ) and
-// disabled (the sub just crossed the threshold → caller evicts its cache).
+// disabled (the subscription crossed the threshold).
 func (r *DeliveryLogRepo) FinalizeFailure(ctx context.Context, id, subscriptionID string, httpStatus *int, errorDetails string, disableThreshold int) (bool, bool, error) {
 	won, disabled := false, false
 	err := r.inTx(ctx, "finalize", func(tx pgx.Tx) error {

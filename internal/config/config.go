@@ -1,9 +1,6 @@
-// Package config loads and validates all runtime configuration from the
-// environment into a single typed struct. It is stdlib-only (os.Getenv + manual
-// parsing) by design — see the implementation plan's "Technology Choices".
-//
-// The field set and defaults are the single source of truth referenced by the
-// plan's Configuration table; keep them in sync.
+// Package config loads and validates runtime configuration from the environment
+// into a single typed struct using only the standard library. The field set and
+// defaults are the source of truth for the README configuration table.
 package config
 
 import (

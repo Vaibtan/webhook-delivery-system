@@ -3,505 +3,265 @@
 [![CI](https://github.com/Vaibtan/webhook-delivery-system/actions/workflows/ci.yml/badge.svg)](https://github.com/Vaibtan/webhook-delivery-system/actions/workflows/ci.yml)
 [![Go](https://img.shields.io/badge/go-1.26-00ADD8?logo=go&logoColor=white)](go.mod)
 
-A production-grade webhook delivery service written in **Go 1.26** — a portfolio port of a Python FastAPI/Celery service. It accepts signed webhook events, persists every delivery attempt to PostgreSQL, and delivers them to subscriber endpoints with at-least-once semantics: exponential backoff with jitter, a per-URL circuit breaker, per-subscription rate limiting and concurrency control, secret rotation with a grace window, replay-attack protection, SSRF-safe outbound dialing, and a dead-letter queue with replay. Celery is replaced entirely by native Go concurrency (a bounded goroutine worker pool over a Redis queue + sorted-set retry scheduler). The runtime depends on **three third-party packages** — [`pgx/v5`](https://github.com/jackc/pgx), [`go-redis/v9`](https://github.com/redis/go-redis), [`golang-migrate`](https://github.com/golang-migrate/migrate) — **plus `golang.org/x/sync`** (the Go team's extended-stdlib `errgroup`); everything else is the standard library.
+A production-oriented webhook ingestion and delivery service built with Go, PostgreSQL, and Redis. It authenticates inbound events, persists delivery state before enqueueing work, sends signed outbound webhooks, retries transient failures, and exposes replay, dead-letter, status, and operational APIs.
 
----
+The implementation uses `net/http`, explicit dependency injection, consumer-owned interfaces, and native goroutine supervision. PostgreSQL is authoritative; Redis accelerates queueing, retry scheduling, dead-letter indexing, and subscription reads.
 
-## Table of Contents
+## System design
 
-1. [Architecture (ADR)](#architecture-adr)
-2. [Delivery Guarantee Statement](#delivery-guarantee-statement)
-3. [Authentication & Authorization](#authentication--authorization)
-4. [Signature Scheme & Client Migration Note](#signature-scheme--client-migration-note)
-5. [Setup & Run](#setup--run)
-6. [Configuration](#configuration)
-7. [API Reference](#api-reference)
-8. [curl Examples](#curl-examples)
-9. [Signing Helper Script](#signing-helper-script)
-10. [Observability](#observability)
-11. [Testing](#testing)
-12. [Architectural Considerations / Future Work](#architectural-considerations--future-work)
-13. [Deployment](#deployment)
-14. [Credits](#credits)
+![Webhook delivery system design](docs/architecture/Screenshot%202026-07-18%20222303.png)
 
----
+The editable source is [`docs/architecture/webhook-system-design.excalidraw`](docs/architecture/webhook-system-design.excalidraw). See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for delivery invariants, failure recovery, module boundaries, and scaling constraints.
 
-## Architecture (ADR)
+## Product applications
 
-The service uses a **ports-and-adapters** core with consumer-owned seams. **`internal/domain` imports nothing outside the standard library**; API, workers, lifecycle, and subscription state declare the capabilities they consume, and concrete adapters satisfy them implicitly.
+Product teams can use this service as a shared event-delivery layer instead of rebuilding signing, retries, failure recovery, and delivery visibility for every integration. A producer publishes a domain event, subscriptions route it to customer or internal endpoints, and operators can inspect, replay, or acknowledge failed deliveries.
 
-```
-                        cmd/server/main.go
-        parse config -> init adapters -> wire services -> lifecycle.Run
-                 |                                  |
-        internal/api  (net/http ServeMux)   internal/worker  (pool, scheduler,
-        handlers, middleware                  recovery, cleanup, dlq-reconciler)
-                 \                                  /
-        internal/subscription (cache + policy state)  internal/lifecycle
-                         \                 /
-                       internal/domain
-            Subscription, DeliveryLog, values, port,
-                 sentinel errors  (ZERO external imports)
-                 /                                  \
-        internal/store  (PostgreSQL/pgx)    internal/infra/*  (queue, scheduler,
-        repository impls, raw SQL, txns       breaker, ratelimit, safedial,
-                                              signature, metrics)
-```
+| Application | Example events | Product value |
+|---|---|---|
+| Payments and billing | `payment.succeeded`, `invoice.overdue`, `refund.created` | Keep merchant, accounting, and risk systems synchronized with replayable notifications. |
+| Commerce and fulfillment | `order.created`, `shipment.dispatched`, `inventory.low` | Connect storefronts, warehouses, carriers, and customer-notification services without tight coupling. |
+| SaaS integrations | `account.created`, `subscription.changed`, `record.updated` | Offer customer-configured integrations without maintaining a separate delivery worker for every destination. |
+| Identity and security | `user.invited`, `role.changed`, `suspicious_login` | Send signed events to IAM, SIEM, audit, and compliance systems. |
+| Developer tooling and operations | `build.failed`, `deployment.completed`, `incident.opened` | Trigger ChatOps, release automation, alert enrichment, and incident workflows. |
+| Monitoring and connected devices | `threshold.exceeded`, `device.offline`, `maintenance.required` | Drive downstream alerts and automation while isolating slow or failing subscribers. |
 
-| Layer | Responsibility |
-|---|---|
-| `cmd/server` | Composition root: parse config, run embedded migrations, and wire adapters via DI. |
-| `internal/config` | Typed `Config` struct, stdlib `os.Getenv` parsing — no config framework. |
-| `internal/domain` | Entities (`Subscription`, `DeliveryLog`), enums, value types, delivery service port, sentinel errors. Pure stdlib. |
-| `internal/api` | `net/http` `ServeMux` (Go 1.22+ `{id}` path params), middleware chain, handlers. |
-| `internal/store` | `pgx/v5` pool + raw-SQL repository implementations (cursor pagination, transactions). |
-| `internal/subscription` | Deep subscription-state boundary: durable mutations, Redis read-through coherence, delivery outcomes, rate limits, and concurrency controls. |
-| `internal/lifecycle` | Supervises HTTP and background processes, coordinated cancellation, bounded shutdown, and worker draining. |
-| `internal/infra/*` | Redis queue/scheduler, circuit breaker, token-bucket rate limiter, SSRF dialer, HMAC signer, latency metrics. |
-| `internal/worker` | Bounded worker pool, retry scheduler, orphan recovery, retention cleanup, DLQ reconciler — all goroutine-based. |
+The strongest fit is event-driven integration where consumers accept at-least-once delivery and deduplicate by webhook ID. Workflows requiring strict global ordering or exactly-once processing need additional coordination outside this service.
 
-### Key design decisions (and why)
+## Core behavior
 
-- **One row per attempt (immutable delivery log).** Each delivery attempt is its own `delivery_logs` row, mirroring the source system's `create_retry_log`. `delivery_logs.id` (`X-Webhook-Delivery-ID`) is unique per attempt; `webhook_id` (`X-Webhook-ID`) is shared across all attempts of one event. This single decision is load-bearing for the status endpoint, the metrics summary, the retry scheduler, and orphan recovery — a scheduled retry is a *new* `pending` row, so the recovery scan that looks for `status='pending'` provably catches lost retries, not just first attempts. (Plan §0.)
-- **CAS + single-transaction + visibility-lease lifecycle.** Every status transition is a compare-and-swap (`UPDATE … WHERE id=$1 AND status='pending'`); a 0-row result means another worker already finalized it, so the loser aborts with no side effects. The `failed_attempt` update and its successor `INSERT` share **one transaction**, so a crash can never strand a `failed_attempt` row without a `pending` successor. When a worker claims a row it stamps a `VISIBILITY_TIMEOUT` lease (`next_retry_at = now()+lease WHERE … AND next_retry_at <= now()`), which is itself the mutual-exclusion point for duplicate dequeues. **Postgres is the source of truth; Redis is a derived index** healed by the recovery job and the DLQ reconciler. (Plan §0, §1.)
-- **Redis sorted-set retry scheduler with an atomic Lua claim.** Due retries are moved from `webhook:retry:schedule` (ZSET, `score = next_retry_at`) into `webhook:queue` by a single Lua script (`ZRANGEBYSCORE` + `ZREM` + `LPUSH`), eliminating the race where two schedulers claim the same retry. (Plan §2.)
-- **Per-URL circuit breaker with a generation-token authoritative probe.** A Closed→Open→Half-Open FSM built on `sync/atomic`. `Allow()` returns a generation token; only a result still carrying the current generation can change state, so a late-finishing request can't spuriously close the breaker. A breaker denial reschedules the `pending` row **without consuming a retry attempt**, so a down target never burns a healthy payload's 5-attempt budget. (Plan §3.)
-- **Per-subscription token-bucket rate limiter + non-blocking concurrency semaphore.** A mutex-only, fixed-point token bucket per subscription enforces ingest rate **after HMAC authentication**, so knowing a subscription UUID is insufficient to exhaust its quota. A per-subscription semaphore (acquired **non-blockingly**) caps in-flight deliveries; if a subscription is at its limit the worker reschedules with a short backoff (no attempt consumed) rather than parking, preventing head-of-line blocking. (Plan §4, Adv §3.)
-- **Race-safe subscription cache.** Read-through and mutation paths for the same subscription are lock-striped, so an in-flight miss cannot restore a stale secret, URL, or active flag after a committed write. If Redis invalidation fails, an in-process dirty marker bypasses the stale entry until repair or TTL expiry.
-- **Bounded inbound HTTP connections.** The API combines 1 MiB global / 64 KiB ingest body caps with header, full-request-read, response-write, idle, and maximum-header limits, so a slow client cannot hold a connection indefinitely by trickling a body.
-- **SSRF-safe dialer.** The outbound `http.Transport` dials through a custom `SafeDialContext` built on `net/netip` that resolves the host and rejects loopback/private/link-local/CGNAT/reserved ranges (with `Unmap()` to defeat the `::ffff:` IPv4-mapped bypass), pins the vetted IP to defeat DNS rebinding, sets `Proxy: nil` so a proxy env var can't tunnel around the check, and enforces a redirect cap + HTTPS-downgrade rejection. (Plan §6.)
-- **Postgres-authoritative idempotency (NOT Redis `SETNX`).** The optional `X-Idempotency-Key` is deduped via an `INSERT … ON CONFLICT DO NOTHING` into `ingest_idempotency` **in the same transaction** as the initial `pending` delivery row. A Redis-only `SETNX` would commit the dedupe marker before the DB write and could acknowledge a key whose webhook never durably landed — the atomic Postgres path makes that failure mode impossible. (Plan §5.)
+- **At-least-once delivery, without ordering guarantees.** Consumers must deduplicate using the stable `X-Webhook-ID`. `X-Webhook-Delivery-ID` identifies one attempt.
+- **Durable-before-async.** Ingest writes a `pending` attempt to PostgreSQL before its ID is pushed to Redis. Recovery re-enqueues due rows when a post-commit Redis write is lost.
+- **Atomic retry chains.** A failed attempt and its successor `pending` attempt are committed in one PostgreSQL transaction.
+- **CAS delivery lifecycle.** Visibility leases and conditional state transitions prevent duplicate queue entries from finalizing the same attempt twice.
+- **Bounded retries.** Failures use capped ×3 backoff with ±20% jitter before the terminal attempt enters the DLQ.
+- **Operational recovery.** Retry polling, orphan recovery, DLQ reconciliation, retention cleanup, and registry sweeping run continuously under one lifecycle supervisor.
+- **Subscription isolation.** Each subscription has its own ingest token bucket and outbound concurrency semaphore. Circuit breakers are keyed by target URL.
+- **Security at the boundary.** Inbound HMAC verification, timestamp replay protection, signed idempotency keys, secret rotation, request-size limits, fail-closed admin auth, and SSRF-safe outbound dialing are built in.
 
----
+## Quick start
 
-## Delivery Guarantee Statement
+Requirements:
 
-**At-least-once delivery, with NO ordering guarantee.**
+- Go 1.26
+- Docker with Compose
 
-- Because each attempt is a distinct row, **`X-Webhook-Delivery-ID` is unique per attempt** while **`X-Webhook-ID` is stable across all attempts of one event**. Consumers **must dedupe on `X-Webhook-ID`** and may use `Webhook-Timestamp` for staleness/ordering decisions.
-- The terminal-transition CAS and visibility lease make a rare double-delivery harmless at the DB layer, but a duplicate HTTP call of the same `X-Webhook-Delivery-ID` is bounded only by at-least-once — hence the dedupe requirement.
-- **Scope of the guarantee.** The single deletion path *outside* `cleanup.go` is the explicit, operator-initiated subscription delete, which `ON DELETE CASCADE`s its `delivery_logs` (including still-`pending` and un-acked DLQ rows). The at-least-once guarantee therefore holds **for a subscription's lifetime, not past its deletion**. `cleanup.go` itself never reaps undelivered work (`status <> 'pending'` guard).
-- **Limits are per-instance.** v1 runs a **single instance**, so the per-subscription rate limit, per-subscription concurrency cap, and per-URL circuit breakers live in process memory and the configured numbers are exact. With *N* replicas the effective limits would be *N×*; distributing them (Redis-backed) is documented future work.
-
----
-
-## Authentication & Authorization
-
-| Route group | Auth |
-|---|---|
-| `POST /api/v1/ingest/{id}` | **Per-subscription HMAC** — `X-Hub-Signature-256` + `Webhook-Timestamp`. No admin token. |
-| `GET /api/v1/health`, `GET /api/v1/ready` | **Public** (platform liveness/readiness probes). |
-| `GET /api/v1/docs`, `GET /api/v1/openapi.json` | **Public** (spec only, no secrets). |
-| All other routes — subscription CRUD, rotate-secret, replay, dlq/ack, status, monitor, debug/vars, pprof | **Admin auth** — `Authorization: Bearer <ADMIN_API_KEY>`, **constant-time** compared. |
-
-- The admin middleware **fails closed**: if `ADMIN_API_KEY` is unset the admin group returns **`503`**, so the service can never be deployed accidentally wide-open. A present-but-mismatched/absent token on a request returns **`401`**.
-- **Secret redaction.** Subscription responses (create/get/list/update) never include `secret_key` or `previous_secret_key`. The plaintext secret is shown **once** — at create and at `rotate-secret` — and never again.
-- A **single static admin credential is a deliberate v1 choice** for a portfolio build. Per-user tokens / JWT / mTLS (real per-subscription authorization isolation) is the documented production evolution.
-
----
-
-## Signature Scheme & Client Migration Note
-
-> **⚠ Behavioral divergence from the Python system — this breaks existing clients.**
-
-The Go service signs **one canonical grammar in both directions**:
-
-```
-signed_message  = timestamp + "." + idempotency_key + "." + body
-signature_header = "sha256=" + hex( HMAC-SHA256(secret, signed_message) )
-```
-
-- **`timestamp`** — the value of the now-**required** `Webhook-Timestamp` ingest header (unix seconds, digits only). Verified against a **5-minute drift window** (`SIGNATURE_DRIFT_WINDOW`) for replay protection.
-- **`idempotency_key`** — the optional inbound `X-Idempotency-Key`, or the **empty string** when absent. **Always empty for outbound deliveries.** Charset is `[A-Za-z0-9_-]{1,128}`, which excludes the `.` delimiter so the field boundaries are unambiguous when the verifier reconstructs the message.
-- **`body`** — the exact transmitted body bytes (inbound: the raw received body; outbound: the once-canonicalized JSON that is actually sent).
-- **Header format** — `X-Hub-Signature-256: sha256=<hex>`.
-
-**Why the key is folded into the signed bytes.** `X-Idempotency-Key` is part of the signed material (not a free, unsigned header). This stops an attacker from defeating dedupe by mutating only the key while a body+timestamp-only signature still verifies. The key is then deduped **Postgres-authoritatively** (`ingest_idempotency`, see ADR) — a repeat key is an idempotent no-op that returns the original `X-Webhook-ID` and never double-enqueues.
-
-**Secret rotation.** Verification tries the current `secret_key`, then falls back to `previous_secret_key` if still within the `SECRET_GRACE_WINDOW` (24h) after rotation — zero-downtime rotation.
-
-### Migration note (Python → Go)
-
-The old Python clients signed **canonical JSON with no timestamp** and sent only `X-Hub-Signature-256`. They **will not verify against the Go service**. To migrate, a client must now:
-
-1. Send a `Webhook-Timestamp: <unix_seconds>` header on every ingest (within ±5 minutes of server time).
-2. Compute the HMAC over `timestamp + "." + idempotency_key + "." + body` (with `idempotency_key` empty unless an `X-Idempotency-Key` is also sent), **not** over canonical JSON.
-3. Send the result as `X-Hub-Signature-256: sha256=<hex>`.
-
-A request without `Webhook-Timestamp`, or outside the drift window, is rejected before signature comparison.
-
----
-
-## Setup & Run
-
-### Prerequisites
-
-- **Go 1.26**
-- **Docker** (for local Postgres + Redis)
-
-### 1. Start infrastructure
-
-Brings up `postgres:16-alpine` + `redis:7-alpine` (Redis with AOF persistence so the queue/schedule/DLQ survive a restart):
+Start PostgreSQL and Redis:
 
 ```bash
 docker compose -f docker/docker-compose.yml up -d
 ```
 
-### 2. Environment
+Set the required environment and run the server:
 
 ```bash
 export DATABASE_URL="postgres://webhook:webhook@localhost:5432/webhook?sslmode=disable"
 export REDIS_URL="redis://localhost:6379/0"
-export ADMIN_API_KEY="dev-admin-key"      # any non-empty value; the admin group fails closed without it
-export ALLOW_HTTP_URLS=true               # local dev only — permit non-HTTPS target URLs
-```
+export ADMIN_API_KEY="dev-admin-key"
+export ALLOW_HTTP_URLS=true
 
-### 3. Run
-
-Migrations run **embedded on startup** (golang-migrate as a library) — no separate migrate step is required.
-
-```bash
-make run            # equivalent to: go run ./cmd/server
-# or, directly:
 go run ./cmd/server
 ```
 
-> **Windows note:** `make` is not installed by default. Use Git Bash + `choco install make`, or run the underlying `go` / `docker compose` commands shown in each recipe directly — every Makefile target is a thin wrapper over them.
+PowerShell uses the same values with `$env:DATABASE_URL=...`, `$env:REDIS_URL=...`, and so on. The server applies embedded migrations during startup and listens on `:8080` by default.
 
-### 4. Build & run the container
-
-The Dockerfile is a multi-stage build (Go builder → `gcr.io/distroless/static:nonroot`):
+Useful commands:
 
 ```bash
-docker build -t webhook-go .
-docker run --rm -p 8080:8080 \
-  -e DATABASE_URL="postgres://webhook:webhook@host.docker.internal:5432/webhook?sslmode=disable" \
-  -e REDIS_URL="redis://host.docker.internal:6379/0" \
-  -e ADMIN_API_KEY="dev-admin-key" \
-  webhook-go
+go run ./cmd/server -migrate=up    # apply all migrations and exit
+go run ./cmd/server -migrate=down  # roll back one migration and exit
+go test ./...                      # unit tests
+go vet ./...
+golangci-lint run
 ```
 
-### 5. Test & lint
+Fresh integration infrastructure needs the schema before the tagged suite runs:
 
 ```bash
-go test ./...                       # unit tests
-go test -tags=integration ./...     # integration tests (require the infra up)
-make lint                           # golangci-lint run ./...
+go run ./cmd/server -migrate=up
+go test -tags=integration ./...
 ```
 
----
+Stop local infrastructure with:
+
+```bash
+docker compose -f docker/docker-compose.yml down
+```
 
 ## Configuration
 
-All configuration is parsed from the environment into a typed `Config` struct (stdlib only). Defaults below are copied from `internal/config/config.go`.
+`internal/config` parses and validates the environment at startup. Unset values use the defaults below; malformed or unsafe values fail startup instead of silently falling back.
 
-| Env var | Default | Purpose |
-|---|---|---|
-| `DATABASE_URL` | — (**required**) | Postgres DSN for the `pgxpool`. |
-| `REDIS_URL` | — (**required**) | Redis URL (queue, scheduler, DLQ, cache). |
+| Variable | Default | Purpose |
+|---|---:|---|
+| `DATABASE_URL` | required | PostgreSQL DSN. |
+| `REDIS_URL` | required | Redis URL for queues, schedules, DLQ index, and subscription cache. |
 | `PORT` | `8080` | HTTP listen port. |
-| `WEBHOOK_TIMEOUT` | `10s` | Per-delivery HTTP client timeout. |
-| `WORKER_CONCURRENCY` | `50` | `errgroup.SetLimit` for the worker pool. |
-| `PER_SUB_CONCURRENCY` | `5` | Max in-flight deliveries per subscription. |
-| `DRAIN_TIMEOUT` | `30s` | Graceful-shutdown in-flight drain deadline. |
-| `MAX_RETRY_ATTEMPTS` | `5` | Total attempts (1 initial + 4 retries) before DLQ. |
-| `RETRY_BASE_DELAY` | `10s` | Base of the ×3 backoff curve. |
-| `RETRY_MAX_DELAY` | `15m` | Backoff cap guard. |
-| `VISIBILITY_TIMEOUT` | `60s` | Lease stamped on a claimed `pending` row; bounds recovery latency & duplicate risk. |
-| `ORPHAN_THRESHOLD` | `15m` | Age before a lease-less (`next_retry_at IS NULL`) pending row is atomically rearmed and recovered. |
-| `RECOVERY_SCAN_INTERVAL` | `5m` | Period of the orphan-recovery scan. |
-| `LOG_RETENTION_HOURS` | `72` | Cleanup horizon for non-DLQ rows. |
-| `DLQ_MAX_AGE` | `720h` (30d) | Force-ack age for un-acked DLQ entries. |
-| `IDEMPOTENCY_TTL` | `5m` | Prune horizon for `ingest_idempotency`. |
+| `WEBHOOK_TIMEOUT` | `10s` | Outbound request timeout. |
+| `WORKER_CONCURRENCY` | `50` | Maximum concurrent worker tasks. |
+| `PER_SUB_CONCURRENCY` | `5` | Maximum concurrent deliveries per subscription. |
+| `DRAIN_TIMEOUT` | `30s` | Graceful shutdown deadline for in-flight deliveries. |
+| `MAX_RETRY_ATTEMPTS` | `5` | Total attempts, including the initial attempt. |
+| `RETRY_BASE_DELAY` | `10s` | Initial retry delay before jitter. |
+| `RETRY_MAX_DELAY` | `15m` | Retry-delay cap. |
+| `VISIBILITY_TIMEOUT` | `60s` | Lease applied when an attempt is claimed. |
+| `ORPHAN_THRESHOLD` | `15m` | Minimum age before a lease-less pending row is rearmed. |
+| `RECOVERY_SCAN_INTERVAL` | `5m` | Orphan recovery and DLQ reconciliation interval. |
+| `LOG_RETENTION_HOURS` | `72` | Retention for terminal, acknowledged delivery rows. |
+| `DLQ_MAX_AGE` | `720h` | Age at which unacknowledged DLQ rows are force-acknowledged. |
+| `IDEMPOTENCY_TTL` | `5m` | Retention for inbound idempotency records. |
 | `CACHE_TTL` | `5m` | Subscription read-through cache TTL. |
-| `REGISTRY_IDLE_TTL` | `1h` | Idle eviction TTL for in-memory bucket/semaphore/breaker registries. |
-| `RATE_LIMIT_PER_SEC` | `100` | Token-bucket refill rate per subscription. |
-| `RATE_LIMIT_BURST` | `200` | Token-bucket capacity per subscription. |
-| `BREAKER_THRESHOLD` | `5` | Consecutive failures that trip a per-URL breaker Open. |
-| `BREAKER_RESET_TIMEOUT` | `30s` | Open→Half-Open probe delay. |
-| `AUTO_DISABLE_THRESHOLD` | `5` | Consecutive `final_failure`s that set `is_active=FALSE`. |
-| `SIGNATURE_DRIFT_WINDOW` | `5m` | Allowed `Webhook-Timestamp` clock skew (replay window bound). |
+| `REGISTRY_IDLE_TTL` | `1h` | Idle TTL for in-memory bucket, semaphore, and breaker entries. |
+| `RATE_LIMIT_PER_SEC` | `100` | Per-subscription token refill rate. |
+| `RATE_LIMIT_BURST` | `200` | Per-subscription ingest burst capacity. |
+| `BREAKER_THRESHOLD` | `5` | Consecutive failures before a target breaker opens. |
+| `BREAKER_RESET_TIMEOUT` | `30s` | Delay before one half-open probe is admitted. |
+| `AUTO_DISABLE_THRESHOLD` | `5` | Consecutive terminal failures before a subscription is disabled. |
+| `SIGNATURE_DRIFT_WINDOW` | `5m` | Accepted inbound timestamp skew. |
 | `SECRET_GRACE_WINDOW` | `24h` | Previous-secret acceptance window after rotation. |
-| `ALLOW_HTTP_URLS` | `false` | Permit non-HTTPS target URLs (local dev). |
-| `SYNC_DELIVERY` | `false` | Make the first attempt synchronously; retries and maintenance still use the always-on background pipeline. |
-| `ENABLE_PPROF` | `false` | Mount `/api/v1/debug/pprof/`. |
-| `CORS_ALLOWED_ORIGINS` | — | Explicit origin allow-list (never `*` combined with credentials). |
-| `ADMIN_API_KEY` | — (required for admin routes) | Bearer token for management/operational endpoints; the admin group fails closed (`503`) if unset. |
+| `ALLOW_HTTP_URLS` | `false` | Permit non-HTTPS targets; intended for local development. |
+| `SYNC_DELIVERY` | `false` | Run only the first attempt in the ingest request. Background processing remains active. |
+| `ENABLE_PPROF` | `false` | Mount admin-protected `/api/v1/debug/pprof/`. |
+| `CORS_ALLOWED_ORIGINS` | empty | Comma-separated browser-origin allow-list. |
+| `ADMIN_API_KEY` | empty | Bearer token for management APIs. Empty means those routes fail closed with `503`. |
 
-Startup rejects unsafe zero/negative values and contradictory relationships—for example, `VISIBILITY_TIMEOUT <= WEBHOOK_TIMEOUT`, `DRAIN_TIMEOUT < WEBHOOK_TIMEOUT`, `RETRY_MAX_DELAY < RETRY_BASE_DELAY`, or `IDEMPOTENCY_TTL < SIGNATURE_DRIFT_WINDOW`.
+Important validation relationships include:
 
----
+- `VISIBILITY_TIMEOUT > WEBHOOK_TIMEOUT`
+- `DRAIN_TIMEOUT >= WEBHOOK_TIMEOUT`
+- `ORPHAN_THRESHOLD >= VISIBILITY_TIMEOUT`
+- `RETRY_MAX_DELAY >= RETRY_BASE_DELAY`
+- `IDEMPOTENCY_TTL >= SIGNATURE_DRIFT_WINDOW`
 
-## API Reference
+## API and authentication
 
-All endpoints are versioned under `/api/v1`. Paths below match `internal/api/server.go` exactly.
+All routes use the `/api/v1` prefix.
 
-| Method | Path | Auth | Description |
-|---|---|---|---|
-| `GET` | `/api/v1/health` | Public | Liveness probe (pings DB & Redis). |
-| `GET` | `/api/v1/ready` | Public | Readiness probe (worker pool running?). |
-| `GET` | `/api/v1/openapi.json` | Public | OpenAPI 3.1 spec (embedded via `//go:embed`). |
-| `GET` | `/api/v1/docs` | Public | **Interactive Swagger UI** (loads swagger-ui from CDN against `/openapi.json`). |
-| `POST` | `/api/v1/ingest/{id}` | HMAC | Ingest one valid JSON payload for subscription `{id}`. Requires `X-Hub-Signature-256` + `Webhook-Timestamp`; checks `is_active`, then charges the authenticated rate limit; event-type filter; body capped at 64 KB. |
-| `POST` | `/api/v1/subscriptions` | Admin | Create a subscription (HTTPS target required unless `ALLOW_HTTP_URLS=true`). |
-| `GET` | `/api/v1/subscriptions` | Admin | List subscriptions — keyset/cursor pagination (`?limit`, `?cursor`), returns `{items, next_cursor}`. |
-| `GET` | `/api/v1/subscriptions/{id}` | Admin | Get a subscription. |
-| `PUT` | `/api/v1/subscriptions/{id}` | Admin | Update a subscription. |
-| `DELETE` | `/api/v1/subscriptions/{id}` | Admin | Delete a subscription (cascades its delivery logs). |
-| `GET` | `/api/v1/subscriptions/{id}/attempts` | Admin | List recent delivery attempts for the subscription. |
-| `POST` | `/api/v1/subscriptions/{id}/rotate-secret` | Admin | Rotate the signing secret (begins the 24h grace window; returns the new secret once). |
-| `POST` | `/api/v1/subscriptions/{id}/replay/{webhook_id}` | Admin | Replay a failed/DLQ'd webhook (inserts a fresh `pending` chain + enqueues; acks the DLQ entry). |
-| `POST` | `/api/v1/subscriptions/{id}/dlq/{webhook_id}/ack` | Admin | Discard/ack a DLQ entry without replaying (`in_dlq=FALSE`, `LREM` from list). |
-| `GET` | `/api/v1/status/{webhook_id}` | Admin | Webhook status & full attempt history (`attempts[]` + `statistics`). |
-| `GET` | `/api/v1/status/metrics/summary` | Admin | Delivery aggregation over the last `?hours` (default 24). |
-| `GET` | `/api/v1/monitor` | Admin | System health, queue/DLQ depths, circuit-breaker states, latency distribution. |
-| `GET` | `/api/v1/debug/vars` | Admin | `expvar` counters/gauges. |
-| `GET` | `/api/v1/debug/pprof/` | Admin + `ENABLE_PPROF=true` | `net/http/pprof` profiling handler (index, cmdline, profile, symbol, trace). |
+| Method and path | Auth | Purpose |
+|---|---|---|
+| `GET /health` | Public | PostgreSQL and Redis liveness. |
+| `GET /ready` | Public | Dependency and worker-pool readiness. |
+| `GET /docs` | Public | Interactive Swagger UI. |
+| `GET /openapi.json` | Public | Embedded OpenAPI 3.1 specification. |
+| `POST /ingest/{id}` | Subscription HMAC | Validate and persist an event. |
+| `POST /subscriptions` | Admin bearer | Create a subscription and return its secret once. |
+| `GET /subscriptions` | Admin bearer | Keyset-paginated subscription list. |
+| `GET /subscriptions/{id}` | Admin bearer | Get a secret-redacted subscription. |
+| `PUT /subscriptions/{id}` | Admin bearer | Update target, event filters, or active state. |
+| `DELETE /subscriptions/{id}` | Admin bearer | Delete a subscription and cascade its delivery rows. |
+| `GET /subscriptions/{id}/attempts` | Admin bearer | List recent attempts for a subscription. |
+| `POST /subscriptions/{id}/rotate-secret` | Admin bearer | Rotate the secret and return the new value once. |
+| `POST /subscriptions/{id}/replay/{webhook_id}` | Admin bearer | Atomically claim a DLQ row and start a replay chain. |
+| `POST /subscriptions/{id}/dlq/{webhook_id}/ack` | Admin bearer | Acknowledge a DLQ row without replaying it. |
+| `GET /status/{webhook_id}` | Admin bearer | Retrieve all attempt and replay chains for an event. |
+| `GET /status/metrics/summary` | Admin bearer | Aggregate delivery statuses over a time window. |
+| `GET /monitor` | Admin bearer | Queue, DLQ, breaker, status, uptime, and latency data. |
+| `GET /debug/vars` | Admin bearer | `expvar` metrics. |
+| `GET /debug/pprof/` | Admin bearer + flag | Runtime profiling when `ENABLE_PPROF=true`. |
 
-> Interactive API docs are served at **`GET /api/v1/docs`** (Swagger UI). The two-segment `/status/metrics/summary` path is more specific than `/status/{webhook_id}`, so `ServeMux` routes them unambiguously.
+The full request and response schemas are served by the running application at [`/api/v1/docs`](http://localhost:8080/api/v1/docs).
 
----
+## Inbound signing protocol
 
-## curl Examples
+Every ingest request requires:
 
-These assume the server is on `http://localhost:8080` and `ADMIN_API_KEY` is exported. The `sign()` helper computes the ingest signature over the canonical grammar `timestamp + "." + idempotency_key + "." + body`.
+- `Webhook-Timestamp: <unix-seconds>`
+- `X-Hub-Signature-256: sha256=<hex-hmac>`
+- optional `X-Idempotency-Key: [A-Za-z0-9_-]{1,128}`
+
+The signed bytes are:
+
+```text
+timestamp + "." + idempotency_key + "." + raw_body
+```
+
+The idempotency key is an empty string when the header is absent. Including it in the signature prevents an intermediary from changing deduplication semantics without invalidating the request. The key and initial delivery row are committed together in PostgreSQL.
+
+Generate headers with the included helper:
 
 ```bash
-export ADMIN_API_KEY="dev-admin-key"
-ADMIN="Authorization: Bearer $ADMIN_API_KEY"
+python scripts/sign_webhook.py \
+  --secret "$SECRET" \
+  --body '{"event":"order.created","order_id":42}' \
+  --idempotency-key "order-42"
+```
+
+The service verifies the current subscription secret and, during `SECRET_GRACE_WINDOW`, the previous secret. Outbound requests use the same grammar with an empty idempotency-key field and include `X-Webhook-ID`, `X-Webhook-Delivery-ID`, and `X-Delivery-Attempt`.
+
+## Minimal request flow
+
+Create a subscription:
+
+```bash
 BASE="http://localhost:8080/api/v1"
+ADMIN="Authorization: Bearer $ADMIN_API_KEY"
 
-sign() { # args: timestamp idempotency_key body secret  ->  prints "sha256=<hex>"
-  printf '%s' "${1}.${2}.${3}" | openssl dgst -sha256 -hmac "$4" | awk '{print "sha256="$NF}'
-}
-```
-
-### Create a subscription (capture `id` + `secret_key`)
-
-```bash
-RESP=$(curl -s -X POST "$BASE/subscriptions" -H "$ADMIN" -H 'Content-Type: application/json' \
-  --data-raw '{"target_url":"https://example.com/webhook-receiver","event_types":["order.created"]}')
-echo "$RESP"
-
-ID=$(printf '%s' "$RESP"     | python -c 'import sys,json;print(json.load(sys.stdin)["id"])')
-SECRET=$(printf '%s' "$RESP" | python -c 'import sys,json;print(json.load(sys.stdin)["secret_key"])')
-echo "id=$ID secret=$SECRET"   # secret_key is shown ONCE — save it now
-```
-
-### List subscriptions (keyset pagination)
-
-```bash
-curl -s "$BASE/subscriptions?limit=20" -H "$ADMIN"
-# follow the cursor returned as next_cursor:
-curl -s "$BASE/subscriptions?limit=20&cursor=<next_cursor>" -H "$ADMIN"
-```
-
-### Get / update a subscription
-
-```bash
-curl -s "$BASE/subscriptions/$ID" -H "$ADMIN"
-
-curl -s -X PUT "$BASE/subscriptions/$ID" -H "$ADMIN" -H 'Content-Type: application/json' \
-  --data-raw '{"target_url":"https://example.com/webhook-receiver","event_types":["order.created","order.updated"],"is_active":true}'
-```
-
-### Rotate the signing secret
-
-```bash
-curl -s -X POST "$BASE/subscriptions/$ID/rotate-secret" -H "$ADMIN"
-# response includes the new secret_key once; the old one stays valid for 24h
-```
-
-### List delivery attempts
-
-```bash
-curl -s "$BASE/subscriptions/$ID/attempts" -H "$ADMIN"
-```
-
-### Ingest a signed webhook
-
-```bash
-BODY='{"event":"order.created","order_id":42}'
-TS=$(date +%s)
-SIG=$(sign "$TS" "" "$BODY" "$SECRET")
-
-curl -s -X POST "$BASE/ingest/$ID?event_type=order.created" \
-  -H "X-Hub-Signature-256: $SIG" \
-  -H "Webhook-Timestamp: $TS" \
+curl -sS -X POST "$BASE/subscriptions" \
+  -H "$ADMIN" \
   -H 'Content-Type: application/json' \
-  --data-raw "$BODY"
-# 202 Accepted — capture the returned webhook_id for status/replay
+  --data-raw '{"target_url":"https://example.com/webhooks","event_types":["order.created"]}'
 ```
 
-### Ingest with an idempotency key (folded into the signature)
+Save the returned `id` and one-time `secret_key`, generate signing headers, then ingest JSON:
 
 ```bash
-BODY='{"event":"order.created","order_id":42}'
-TS=$(date +%s)
-KEY="order-42-attempt-1"
-SIG=$(sign "$TS" "$KEY" "$BODY" "$SECRET")
-
-curl -s -X POST "$BASE/ingest/$ID?event_type=order.created" \
-  -H "X-Hub-Signature-256: $SIG" \
-  -H "Webhook-Timestamp: $TS" \
-  -H "X-Idempotency-Key: $KEY" \
+curl -sS -X POST "$BASE/ingest/$ID?event_type=order.created" \
+  -H "Webhook-Timestamp: $TIMESTAMP" \
+  -H "X-Hub-Signature-256: $SIGNATURE" \
   -H 'Content-Type: application/json' \
-  --data-raw "$BODY"
-# a repeat with the same KEY is an idempotent no-op returning the original webhook_id
+  --data-raw '{"event":"order.created","order_id":42}'
 ```
 
-### Status, metrics, replay, ack, monitor, delete
+Async mode returns `202 Accepted`. A repeated idempotency key returns the original `webhook_id` with `200 OK` and does not enqueue another attempt. In sync mode, the first attempt runs in-request and returns `200`; retries still use the background pipeline.
 
-```bash
-WID="<webhook_id-from-ingest>"
+## Observability and operations
 
-curl -s "$BASE/status/$WID" -H "$ADMIN"                       # full attempt history
-curl -s "$BASE/status/metrics/summary?hours=24" -H "$ADMIN"   # aggregate metrics
+- JSON logs use `log/slog`; API logs carry a generated request ID and delivery logs carry delivery/webhook IDs.
+- `/monitor` combines PostgreSQL status counts with Redis queue/DLQ depths, circuit-breaker states, uptime, and a bounded latency histogram (`min`, `max`, `avg`, `p50`, `p95`, `p99`).
+- `/debug/vars` publishes `expvar` delivery counters.
+- `/debug/pprof/` is disabled by default and requires both the feature flag and admin authentication.
+- `SIGINT` and `SIGTERM` stop new dequeue work, shut down HTTP with a bounded context, and wait for in-flight deliveries to drain.
+- Cleanup never deletes `pending` or unacknowledged DLQ rows. Explicit subscription deletion is the one operation that cascades all delivery history for that subscription.
 
-curl -s -X POST "$BASE/subscriptions/$ID/replay/$WID" -H "$ADMIN"        # replay a DLQ'd webhook
-curl -s -X POST "$BASE/subscriptions/$ID/dlq/$WID/ack" -H "$ADMIN"       # discard a DLQ entry
+## Testing and CI
 
-curl -s "$BASE/monitor" -H "$ADMIN"                           # system metrics JSON
+Unit tests cover configuration, validation, signing, middleware, lifecycle supervision, rate limiting, circuit breaking, worker behavior, and retry math. Integration tests use live PostgreSQL and Redis to exercise atomic ingest, duplicate dequeue claims, retry recovery, DLQ replay/ack, cache coherence, cleanup safety, and synchronous-to-background retry handoff.
 
-curl -s -X DELETE "$BASE/subscriptions/$ID" -H "$ADMIN"       # delete (cascades delivery logs)
-```
+GitHub Actions runs:
 
----
-
-## Signing Helper Script
-
-A Python helper, [`scripts/sign_webhook.py`](scripts/sign_webhook.py), computes the `X-Hub-Signature-256` and `Webhook-Timestamp` headers using the exact canonical grammar:
-
-```bash
-python scripts/sign_webhook.py --secret "$SECRET" --body '{"event":"order.created"}'
-# prints:
-#   Webhook-Timestamp: <unix_seconds>
-#   X-Hub-Signature-256: sha256=<hex>
-
-# with an idempotency key:
-python scripts/sign_webhook.py --secret "$SECRET" --body '{"event":"order.created"}' \
-  --idempotency-key "order-42-attempt-1"
-```
-
----
-
-## Observability
-
-- **`GET /api/v1/monitor`** — JSON with `uptime_seconds`, `delivery_metrics` (total/success/failed_attempt/final_failure/pending), `queue_depth`, `dead_letter_queue_depth`, `circuit_breakers` (per-URL state), and `delivery_latency_ms` with `min/max/avg/p50/p95/p99`. Percentiles come from a small fixed-size, mutex-guarded **bounded histogram** (log-linear buckets) in the deliverer — stdlib only, O(1) per observation, no Prometheus dependency.
-- **`GET /api/v1/debug/vars`** — `expvar` counters and gauges.
-- **`GET /api/v1/debug/pprof/`** — `net/http/pprof` (index, cmdline, profile, symbol, trace), **env-gated** (`ENABLE_PPROF=true`) **and** admin-authed.
-- **Structured logging** via `log/slog` with context-propagated request IDs throughout the middleware chain.
-
-Example `/monitor` response:
-
-```json
-{
-  "uptime_seconds": 86400,
-  "current_time": "2026-06-18T22:00:00Z",
-  "delivery_metrics": { "total": 1523, "success": 1400, "failed_attempt": 80, "final_failure": 3, "pending": 40 },
-  "queue_depth": 12,
-  "dead_letter_queue_depth": 1,
-  "circuit_breakers": { "https://example.com/webhook-receiver": "closed" },
-  "delivery_latency_ms": { "min": 12, "max": 2400, "avg": 84, "p50": 42, "p95": 195, "p99": 450 }
-}
-```
-
----
-
-## Testing
-
-```bash
-go test ./...                       # unit tests
-go test -tags=integration ./...     # integration tests (require docker infra up)
-make lint                           # golangci-lint, clean
-```
-
-- **Unit tests** cover signature sign/verify, request/cursor validation, configuration invariants, authenticated rate-limit ordering, HTTP server timeouts, the SSRF `safedial` classifier, the circuit-breaker FSM (including stale-generation rejection), the token-bucket rate limiter, recovery pagination, intentional non-DLQ drops, the in-memory registries, the latency metrics histogram, and worker-pool teardown semantics.
-- **Integration tests** (behind the `integration` build tag) exercise the high-risk failure modes against real Postgres + Redis:
-  - cleanup never deletes `pending` rows,
-  - concurrent same-key ingest collapses to one row,
-  - single-claim dequeue (no double-delivery under duplicate queue entries),
-  - concurrent replay produces exactly one new chain,
-  - recovery drains more than one batch and atomically rearms threshold-old lease-less rows,
-  - a read-through cache miss racing an update cannot restore stale subscription state,
-  - an in-request first failure is retried by the background pipeline,
-  - intentional inactive-subscription drops remain outside the DLQ.
-- The codebase is **golangci-lint clean**.
-- **Continuous integration** ([`.github/workflows`](.github/workflows)): every push and pull request runs lint (`go vet` + `gofmt` + golangci-lint), the unit suite under the race detector (`go test -race -shuffle=on`), and the full integration suite against ephemeral Postgres + Redis service containers (migrated first). Dependabot tracks module, Actions and Docker updates. The race detector runs on the Linux runners (CGO available) where it cannot on the Windows dev box.
-
----
-
-## Architectural Considerations / Future Work
-
-Evaluated during design, deferred for v1, documented for discussion (plan's Architectural Considerations table):
-
-| Pattern | Why deferred / future path |
-|---|---|
-| **Transactional Outbox** | Orphan-recovery + the visibility lease keep the dual-write (DB insert + Redis push) correct and far simpler; add an `outbox` table + relay goroutine if lost-enqueue rates become measurable. |
-| **Fair queue scheduling** | A single Redis LIST + per-sub concurrency semaphores gives adequate fairness; per-subscription LISTs with weighted round-robin is the next step. |
-| **Distributed rate / concurrency limits** | In-memory limits are exact on a single instance; horizontal scale-out needs Redis token buckets (Lua) + leased per-subscription concurrency counters. |
-| **Wildcard event matching** | Exact `slices.Contains` matching today; `order.*`-style prefix/glob matching behind a feature flag later. |
-| **Per-user authorization** | Single static `ADMIN_API_KEY` in v1; scoped tokens / JWT / mTLS for real per-subscription isolation. |
-
----
+- `go vet`, `gofmt`, and `golangci-lint`
+- build and dependency checks
+- shuffled unit tests under the race detector
+- integration tests under the race detector with PostgreSQL and Redis services
 
 ## Deployment
 
-Target: a low-cost PaaS (**Railway**) with managed Postgres + Redis, deployed from
-the root `Dockerfile` (the multi-stage → distroless image). Migrations run embedded
-on startup, so the deploy is self-provisioning. Build config: `railway.toml` /
-`railway.json` (`DOCKERFILE` builder, healthcheck `/api/v1/health`); `Procfile` is a
-buildpack fallback.
+The root `Dockerfile` builds a static Go binary and runs it as a non-root user in a distroless image. `railway.toml` and `railway.json` configure Dockerfile builds and `/api/v1/health` checks; `Procfile` is available for buildpack-style platforms.
 
-### Deploy steps (Railway)
+Production deployment requires PostgreSQL, Redis, `DATABASE_URL`, `REDIS_URL`, and a strong `ADMIN_API_KEY`. Migrations run during startup, so multiple replicas should not be introduced until the deployment has an explicit migration strategy and distributed rate/concurrency controls.
 
-1. Create a Railway project and add the **PostgreSQL** and **Redis** plugins.
-2. Add a service from this repo (Railway detects the root `Dockerfile`).
-3. Set service variables:
-   - `DATABASE_URL` → reference the Postgres plugin's connection string.
-   - `REDIS_URL` → reference the Redis plugin's URL.
-   - `ADMIN_API_KEY` → a strong random secret (the admin group fails closed without it).
-   - Optionally `CORS_ALLOWED_ORIGINS`, `ENABLE_PPROF`, etc.
-4. Deploy. Railway injects `PORT`; the server binds it and migrates on boot.
-5. Verify: `curl https://<your-app>.up.railway.app/api/v1/health` → `200`.
+Current rate limits, concurrency semaphores, and circuit breakers are process-local. A single replica gives exact configured limits; with `N` replicas those effective limits multiply by `N`.
 
-- **Deployed URL:** _set after deploying (e.g. `https://<your-app>.up.railway.app`)._
+## Project layout
 
-### Monthly cost estimate
+| Path | Responsibility |
+|---|---|
+| `cmd/server` | Configuration, migrations, dependency composition, and process registration. |
+| `internal/api` | HTTP routing, middleware, handlers, DTOs, and embedded OpenAPI. |
+| `internal/domain` | Entities, value types, validation, statuses, and sentinel errors. |
+| `internal/store` | PostgreSQL repositories and transactional delivery lifecycle. |
+| `internal/subscription` | Subscription CRUD, read-through cache coherence, delivery consequences, token buckets, and semaphores. |
+| `internal/worker` | Delivery engine, worker pool, retry polling, recovery, cleanup, and DLQ reconciliation. |
+| `internal/lifecycle` | Coordinated cancellation, HTTP shutdown, and process draining. |
+| `internal/infra` | Redis adapters, circuit breaker, metrics, HMAC, SSRF-safe dialing, and concurrency primitives. |
+| `migrations` | Embedded PostgreSQL schema and indexes. |
+| `docker` | Local PostgreSQL and Redis Compose stack. |
 
-Workload: 24×7 uptime + ~5,000 webhooks/day × ~1.2 attempts ≈ **6,000 outbound
-attempts/day (~180k/month, ~0.07 req/s average)**. This is a *tiny* request rate —
-cost is dominated by the 24×7 idle baseline of the three always-on components, not by
-request volume. The Go service is a ~25 MB static binary that idles at low CPU and
-~64–128 MB RAM.
+## Runtime dependencies
 
-| Component | Sizing | Est. / month |
-|---|---|---|
-| Go service (1 instance) | ~128 MB RAM, <0.1 vCPU avg | ~$3–5 |
-| Managed PostgreSQL | small instance, ~0.5 GB RAM | ~$5–8 |
-| Managed Redis | small instance, ~0.25 GB RAM | ~$3–5 |
-| **Total** | | **~$11–18 / month** |
+- [`pgx/v5`](https://github.com/jackc/pgx) for PostgreSQL
+- [`go-redis/v9`](https://github.com/redis/go-redis) for Redis
+- [`golang-migrate`](https://github.com/golang-migrate/migrate) for embedded migrations
+- [`golang.org/x/sync`](https://pkg.go.dev/golang.org/x/sync) for bounded goroutine groups
 
-On Railway's **Hobby plan** ($5/month, includes $5 of usage) the workload's compute is
-low enough that the bill is essentially the three components' idle baseline; expect
-**~$10–18/month** in practice. The request volume itself adds negligible cost.
-
-> **Why a single instance (v1):** the rate limiter, per-subscription concurrency
-> semaphores, and circuit breakers live in process memory, so per-instance == global
-> only at one replica. Horizontal scale-out would require moving that state to Redis
-> (Lua token buckets + leased counters) — documented as future work above.
-
----
-
-## Credits
-
-Built with **Go**. Runtime dependencies:
-
-- [`github.com/jackc/pgx/v5`](https://github.com/jackc/pgx) — PostgreSQL driver + connection pool.
-- [`github.com/redis/go-redis/v9`](https://github.com/redis/go-redis) — Redis client (queue, scheduler, DLQ, cache, Lua).
-- [`github.com/golang-migrate/migrate/v4`](https://github.com/golang-migrate/migrate) — embedded database migrations.
-- [`golang.org/x/sync`](https://pkg.go.dev/golang.org/x/sync) — `errgroup` (Go-team extended stdlib).
-
-Test-only: [`github.com/stretchr/testify`](https://github.com/stretchr/testify) (not in the production binary). The interactive docs page loads **Swagger UI** from a CDN.
-
-Developed with AI assistance.
+`testify` is test-only. The interactive API page loads Swagger UI from a CDN.
