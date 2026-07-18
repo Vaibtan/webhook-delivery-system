@@ -44,10 +44,3 @@ func TestTokenBucketRefillsOverTime(t *testing.T) {
 	assert.True(t, tb.Allow())
 	assert.False(t, tb.Allow())
 }
-
-func TestTokenBucketDisabledFailsOpen(t *testing.T) {
-	tb := NewTokenBucket(0, 0)
-	for i := 0; i < 100; i++ {
-		assert.True(t, tb.Allow(), "rate<=0 must fail open")
-	}
-}

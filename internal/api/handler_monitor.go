@@ -8,7 +8,6 @@ import (
 	"github.com/Vaibtan/webhook-delivery-system/internal/infra/metrics"
 )
 
-// monitorResponse is the /monitor JSON shape (plan § monitor).
 type monitorResponse struct {
 	UptimeSeconds      int64                     `json:"uptime_seconds"`
 	CurrentTime        string                    `json:"current_time"`
@@ -34,7 +33,7 @@ func (s *Server) handleMonitor(w http.ResponseWriter, r *http.Request) {
 	resp.DeliveryLatencyMs = s.opts.Metrics.Latency()
 
 	// Delivery metrics by status (all-time), from Postgres.
-	if counts, err := s.opts.DeliveryLogs.CountByStatusSince(ctx, time.Time{}); err == nil {
+	if counts, err := s.opts.DeliveryStatus.CountByStatusSince(ctx, time.Time{}); err == nil {
 		total := 0
 		for status, n := range counts {
 			resp.DeliveryMetrics[string(status)] = n

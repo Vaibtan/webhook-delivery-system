@@ -66,7 +66,7 @@ func (r *DeliveryLogRepo) ReplayDLQ(ctx context.Context, subscriptionID, webhook
 	return claimedID, newID, ok, nil
 }
 
-// DeleteExpired is the sole retention-driven deleter (plan Adv §1). It removes
+// DeleteExpired is the sole retention-driven deleter. It removes
 // only terminal, non-DLQ rows past the retention horizon — NEVER pending
 // (undelivered work) or in_dlq (un-triaged) rows.
 func (r *DeliveryLogRepo) DeleteExpired(ctx context.Context, retention time.Duration) (int64, error) {
@@ -81,7 +81,7 @@ func (r *DeliveryLogRepo) DeleteExpired(ctx context.Context, retention time.Dura
 	return tag.RowsAffected(), nil
 }
 
-// PruneIdempotency removes ingest_idempotency rows older than ttl (plan §5).
+// PruneIdempotency removes ingest_idempotency rows older than ttl.
 func (r *DeliveryLogRepo) PruneIdempotency(ctx context.Context, ttl time.Duration) (int64, error) {
 	const q = `DELETE FROM ingest_idempotency WHERE created_at < NOW() - ($1 || ' seconds')::interval`
 	tag, err := r.pool.Exec(ctx, q, secondsArg(ttl))
@@ -144,11 +144,11 @@ func (r *DeliveryLogRepo) ForceAckOldDLQ(ctx context.Context, maxAge time.Durati
 	return ids, rows.Err()
 }
 
-// secondsArg renders a duration as an integer-seconds text arg for an interval cast.
+// secondsArg renders a positive duration for a PostgreSQL interval cast.
 func secondsArg(d time.Duration) string {
 	s := int64(d.Seconds())
-	if s < 0 {
-		s = 0
+	if s < 1 {
+		s = 1
 	}
 	return strconv.FormatInt(s, 10)
 }

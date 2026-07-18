@@ -2,7 +2,6 @@
 // scheduling. Each member is a pending delivery-log id; the score is its due
 // unix time. A Lua script atomically moves due entries to webhook:queue,
 // eliminating the multi-replica race of separate ZRANGEBYSCORE + ZREM + LPUSH.
-// See implementation plan §2.
 package scheduler
 
 import (
@@ -13,7 +12,6 @@ import (
 
 	"github.com/redis/go-redis/v9"
 
-	"github.com/Vaibtan/webhook-delivery-system/internal/domain"
 	"github.com/Vaibtan/webhook-delivery-system/internal/infra/queue"
 )
 
@@ -31,7 +29,7 @@ var claimDueScript = redis.NewScript(`
 	return #tasks
 `)
 
-// Scheduler implements domain.RetryScheduler.
+// Scheduler stores durable retry due times in Redis.
 type Scheduler struct {
 	rdb         *redis.Client
 	scheduleKey string
@@ -42,8 +40,6 @@ type Scheduler struct {
 func New(rdb *redis.Client) *Scheduler {
 	return &Scheduler{rdb: rdb, scheduleKey: KeySchedule, queueKey: queue.KeyQueue}
 }
-
-var _ domain.RetryScheduler = (*Scheduler)(nil)
 
 // unixScore renders a time as fractional unix SECONDS with millisecond
 // precision (UnixMilli fits exactly in float64). Using sub-second scores avoids

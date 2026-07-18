@@ -37,8 +37,7 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, status, healthResponse{Status: overall, Checks: checks})
 }
 
-// handleReady is the readiness probe. In Slice 1 it mirrors dependency
-// reachability; Slice 4 upgrades it to require a running worker pool. Public.
+// handleReady requires reachable dependencies and a running worker pool.
 func (s *Server) handleReady(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), healthProbeTimeout)
 	defer cancel()
@@ -47,8 +46,10 @@ func (s *Server) handleReady(w http.ResponseWriter, r *http.Request) {
 		"database": probe(ctx, s.opts.PingDB),
 		"redis":    probe(ctx, s.opts.PingRedis),
 	}
-	if s.opts.WorkerReady != nil {
-		checks["worker"] = boolCheck(s.opts.WorkerReady())
+	if s.opts.WorkerReady() {
+		checks["worker"] = "ok"
+	} else {
+		checks["worker"] = "not_running"
 	}
 
 	status := http.StatusOK
@@ -63,20 +64,10 @@ func (s *Server) handleReady(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, status, healthResponse{Status: overall, Checks: checks})
 }
 
-// probe runs a ping function (nil-safe) and renders an "ok" / error string.
+// probe renders a dependency ping as "ok" or its error.
 func probe(ctx context.Context, fn func(ctx context.Context) error) string {
-	if fn == nil {
-		return "unconfigured"
-	}
 	if err := fn(ctx); err != nil {
 		return err.Error()
 	}
 	return "ok"
-}
-
-func boolCheck(ok bool) string {
-	if ok {
-		return "ok"
-	}
-	return "not_running"
 }

@@ -19,7 +19,7 @@ func TestGetCreatesOnceAndReuses(t *testing.T) {
 	assert.Equal(t, "v:a", r.Get("a"))
 	assert.Equal(t, "v:b", r.Get("b"))
 	assert.Equal(t, int32(2), created.Load(), "create called once per distinct key")
-	assert.Equal(t, 2, r.Len())
+	assert.Len(t, r.Snapshot(), 2)
 }
 
 func TestRemove(t *testing.T) {
@@ -27,7 +27,7 @@ func TestRemove(t *testing.T) {
 	r.Get("a")
 	r.Get("b")
 	r.Remove("a")
-	assert.Equal(t, 1, r.Len())
+	assert.Len(t, r.Snapshot(), 1)
 }
 
 func TestSweepEvictsIdle(t *testing.T) {
@@ -43,6 +43,6 @@ func TestSweepEvictsIdle(t *testing.T) {
 
 	evicted := r.Sweep()
 	assert.Equal(t, 1, evicted, "only the stale entry is swept")
-	assert.Equal(t, 1, r.Len())
+	assert.Len(t, r.Snapshot(), 1)
 	assert.Equal(t, 1, r.Get("fresh")) // fresh survived
 }

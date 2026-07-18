@@ -72,8 +72,8 @@ func (s *Server) handleGetSubscription(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, toSubscriptionResponse(sub))
 }
 
-// handleUpdateSubscription applies a partial update (target_url, event_types,
-// is_active). Secret rotation is a separate endpoint (Slice 8).
+// handleUpdateSubscription applies a partial update; secret rotation remains a
+// separate operation.
 func (s *Server) handleUpdateSubscription(w http.ResponseWriter, r *http.Request) {
 	var req updateSubscriptionRequest
 	if !readJSON(w, r, &req) {
@@ -101,7 +101,6 @@ func (s *Server) handleUpdateSubscription(w http.ResponseWriter, r *http.Request
 		writeDomainError(w, r, err)
 		return
 	}
-	s.opts.EvictSubscription(sub.ID)
 	writeJSON(w, http.StatusOK, toSubscriptionResponse(sub))
 }
 
@@ -120,22 +119,19 @@ func (s *Server) handleRotateSecret(w http.ResponseWriter, r *http.Request) {
 		writeDomainError(w, r, err)
 		return
 	}
-	s.opts.EvictSubscription(id)
 	writeJSON(w, http.StatusOK, createSubscriptionResponse{
 		subscriptionResponse: toSubscriptionResponse(sub),
 		SecretKey:            newSecret,
 	})
 }
 
-// handleDeleteSubscription removes a subscription (cascading its delivery_logs)
-// and evicts its in-memory per-sub state (rate bucket, semaphore, cache).
+// handleDeleteSubscription removes a subscription and cascades its delivery logs.
 func (s *Server) handleDeleteSubscription(w http.ResponseWriter, r *http.Request) {
 	id := pathID(r)
 	if err := s.opts.Subscriptions.Delete(r.Context(), id); err != nil {
 		writeDomainError(w, r, err)
 		return
 	}
-	s.opts.EvictSubscription(id)
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -147,7 +143,7 @@ func (s *Server) handleListAttempts(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	limit := parseLimit(r, 50, 200)
-	logs, err := s.opts.DeliveryLogs.ListBySubscription(r.Context(), id, limit)
+	logs, err := s.opts.DeliveryStatus.ListBySubscription(r.Context(), id, limit)
 	if err != nil {
 		writeDomainError(w, r, err)
 		return

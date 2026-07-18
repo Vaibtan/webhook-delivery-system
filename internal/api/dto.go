@@ -153,5 +153,8 @@ func decodeCursor(token string) (*domain.Cursor, error) {
 	if err != nil {
 		return nil, fmt.Errorf("invalid cursor")
 	}
+	if !domain.ValidUUID(parts[1]) {
+		return nil, fmt.Errorf("invalid cursor")
+	}
 	return &domain.Cursor{CreatedAt: ts, ID: parts[1]}, nil
 }

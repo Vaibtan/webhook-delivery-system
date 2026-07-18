@@ -26,8 +26,7 @@ func newSub(t *testing.T, subs *store.SubscriptionRepo) *domain.Subscription {
 	return s
 }
 
-// CLAIM: cleanup must NEVER delete a pending (undelivered) row or an un-acked DLQ
-// row — only terminal, non-DLQ rows past retention.
+// Cleanup must preserve pending and unacknowledged DLQ rows.
 func TestCleanupNeverDeletesPendingOrDLQ(t *testing.T) {
 	ctx := context.Background()
 	pool := testutil.Pool(t)
@@ -63,9 +62,8 @@ func TestCleanupNeverDeletesPendingOrDLQ(t *testing.T) {
 	assert.False(t, exists(failedID), "old failed_attempt reaped")
 }
 
-// CLAIM: concurrent ingest of the SAME idempotency key inserts exactly ONE
-// delivery row (PG ON CONFLICT is atomic with the pending insert — no Redis
-// SETNX crash window). All callers see the same webhook_id.
+// PostgreSQL idempotency inserts one delivery row and returns one webhook ID to
+// every concurrent caller.
 func TestConcurrentSameKeyIngestExactlyOneRow(t *testing.T) {
 	ctx := context.Background()
 	pool := testutil.Pool(t)
@@ -115,9 +113,7 @@ func TestConcurrentSameKeyIngestExactlyOneRow(t *testing.T) {
 	assert.Equal(t, 1, rowCount, "exactly one delivery_logs row exists for the key")
 }
 
-// CLAIM: two workers draining duplicate queue entries for the same still-pending
-// due row both call ClaimPending; the `next_retry_at <= now()` predicate lets
-// exactly ONE win.
+// The visibility-lease CAS admits one worker for duplicate queue entries.
 func TestConcurrentDuplicateDequeueClaimsOnce(t *testing.T) {
 	ctx := context.Background()
 	pool := testutil.Pool(t)
@@ -152,7 +148,7 @@ func TestConcurrentDuplicateDequeueClaimsOnce(t *testing.T) {
 	assert.Equal(t, int32(1), won.Load(), "exactly one worker claims the row")
 }
 
-// CLAIM: concurrent replays of one DLQ entry produce exactly ONE new chain.
+// Concurrent replays produce exactly one new chain.
 func TestConcurrentReplayExactlyOneNewChain(t *testing.T) {
 	ctx := context.Background()
 	pool := testutil.Pool(t)
@@ -191,8 +187,7 @@ func TestConcurrentReplayExactlyOneNewChain(t *testing.T) {
 	assert.Equal(t, 1, maxReplay, "exactly one new chain (replay_number=1) created")
 }
 
-// CLAIM: a lost-enqueue FIRST-ATTEMPT pending row is reclaimed by recovery
-// (complements the retry-row recovery test).
+// Recovery also reclaims a lost first-attempt enqueue.
 func TestRecoveryReclaimsFirstAttempt(t *testing.T) {
 	ctx := context.Background()
 	pool := testutil.Pool(t)
@@ -209,12 +204,47 @@ func TestRecoveryReclaimsFirstAttempt(t *testing.T) {
 		VALUES (gen_random_uuid(), $1, $2, '{}', 1, 0, 'pending', NOW())
 		RETURNING id`, sub.ID, sub.TargetURL).Scan(&id))
 
-	ids, err := logs.FindDuePending(ctx, 100)
+	items, err := logs.FindDuePending(ctx, 100, nil)
 	require.NoError(t, err)
+	ids := make([]string, 0, len(items))
+	for _, item := range items {
+		ids = append(ids, item.ID)
+	}
 	require.Contains(t, ids, id, "first-attempt due pending row is found by recovery scan")
 
 	require.NoError(t, q.Enqueue(ctx, id))
 	depth, err := q.Depth(ctx)
 	require.NoError(t, err)
 	assert.Equal(t, int64(1), depth)
+}
+
+func TestIntentionalDropIsTerminalButNotInDLQ(t *testing.T) {
+	ctx := context.Background()
+	pool := testutil.Pool(t)
+	testutil.Truncate(t, pool)
+
+	subs := store.NewSubscriptionRepo(pool)
+	logs := store.NewDeliveryLogRepo(pool)
+	sub := &domain.Subscription{TargetURL: "https://example.com/hook", SecretKey: "secret", IsActive: true}
+	require.NoError(t, subs.Create(ctx, sub))
+	result, err := logs.IngestPending(ctx, domain.IngestParams{
+		SubscriptionID: sub.ID,
+		WebhookID:      "123e4567-e89b-12d3-a456-426614174000",
+		TargetURL:      sub.TargetURL,
+		Payload:        []byte(`{"ok":true}`),
+	})
+	require.NoError(t, err)
+
+	won, err := logs.MarkDropped(ctx, result.DeliveryLogID, "subscription deactivated")
+	require.NoError(t, err)
+	require.True(t, won)
+	got, err := logs.GetByID(ctx, result.DeliveryLogID)
+	require.NoError(t, err)
+	require.Equal(t, domain.StatusFinalFailure, got.Status)
+	require.False(t, got.InDLQ)
+	require.Nil(t, got.NextRetryAt)
+
+	ids, err := logs.ListInDLQ(ctx)
+	require.NoError(t, err)
+	require.NotContains(t, ids, result.DeliveryLogID)
 }

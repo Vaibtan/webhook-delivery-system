@@ -21,7 +21,7 @@ human (decision, credentials, or a live deploy).
 - [x] **Signature** = `HMAC(timestamp + "." + idempotency_key + "." + <exact transmitted body bytes>)` — **one** canonical grammar both directions (plan §5); `idempotency_key` is empty when absent and always empty outbound; the key charset excludes `.`. Inbound signs the **raw received body** (+ inbound key); outbound signs the **canonical bytes it emits** (empty key). `Webhook-Timestamp` required. Replay is bounded by the timestamp window **plus an optional signed `X-Idempotency-Key`** whose dedupe is **Postgres-authoritative** (`ingest_idempotency`, same txn as the pending insert) — never a Redis `SETNX`, never a deterministic signature-as-nonce.
 - [x] **`cleanup.go` is the only retention-driven row deleter**, and it **never deletes `pending`** (`… AND NOT in_dlq AND status <> 'pending'`); it also prunes `ingest_idempotency` past `IDEMPOTENCY_TTL`. The **one** deletion outside it is the explicit operator-initiated `DELETE /subscriptions/{id}`, which `ON DELETE CASCADE`s that sub's rows by design (plan Delivery Guarantee Statement). Reconciler/auto-disable mutate flags only.
 - [x] **Auth**: `ingest` = per-sub HMAC; `health`/`ready`/`docs`/`openapi.json` = public; **all other routes** (subscription CRUD, rotate-secret, replay, dlq/ack, status, monitor, pprof) require `Authorization: Bearer <ADMIN_API_KEY>` (constant-time, fails closed if unset). Subscription responses **never** return `secret_key`/`previous_secret_key` (shown once at create + rotate).
-- [x] **Cache coherency** (Adv §5): *once the read-through cache exists (Slice 8)*, every subscription write path (update, delete, rotate-secret, auto-disable) must evict `subscription:{id}`. (Before the cache exists there is nothing to evict.)
+- [x] **Cache coherency** (Adv §5): every subscription mutation is serialized with the same key's read-through path and evicts `subscription:{id}` before releasing the guard; invalidation failures install a local bypass marker. This includes delivery transactions that reset/increment counters or auto-disable.
 - [x] Use `find-docs` / `ctx7` for `pgx/v5`, `go-redis/v9`, `golang-migrate` APIs — do not trust training-data signatures. Invoke the `golang-how-to` orchestrator before writing Go.
 - [x] Dev env is Windows 11 / PowerShell — `Makefile` + scripts must run there (note bash/WSL alternative where needed).
 
@@ -77,7 +77,7 @@ The empty-but-running skeleton: config → store → migrations → health endpo
 ## Slice 3 — Core secure tracer bullet: sync ingest → sign → SSRF-safe deliver → status  `AFK`
 **Blocked by:** 2 · **Plan refs:** §0, §5, §6, §7, §8, §9, Phase 2/3
 
-The keystone slice — proves the whole webhook concept end-to-end **synchronously** (`SYNC_DELIVERY=true`, no queue). **SSRF protection ships here** with the first real outbound call. (Rate-limit + per-sub concurrency are **NOT** enforced yet — they layer in Slice 7; ingest is unthrottled until then, noted so this slice isn't a silent contract gap.)
+The keystone slice — proves the whole webhook concept end-to-end with an in-request first attempt (`SYNC_DELIVERY=true`). The final system keeps the queue/scheduler workers alive in this mode so persisted retry successors cannot be stranded. **SSRF protection ships here** with the first real outbound call. (Rate-limit + per-sub concurrency are added in Slice 7.)
 
 **Signature + ingest:**
 - [x] `infra/signature`: `Sign`, `Verify` (constant-time), `CanonicalJSON` (`UseNumber()`; **rejects trailing tokens via a second `Decode` expecting `io.EOF`**, not `dec.More()`). Signing input is always the canonical grammar `timestamp + "." + idempotency_key + "." + <exact bytes of that request body>` (empty key field when absent/outbound; §5). _(unit-tested incl. key-is-signed, large-number preservation.)_
@@ -100,9 +100,9 @@ The keystone slice — proves the whole webhook concept end-to-end **synchronous
 - [x] `infra/queue`: `LPUSH`/`BRPOP` on `webhook:queue`; `ErrQueueEmpty` on timeout.
 - [x] `worker/pool`: `errgroup.Group` + `SetLimit(WORKER_CONCURRENCY)`; 2s BRPOP; `Process` **never returns non-nil on delivery failure** (§1 rule 1); drain ctx via `context.WithoutCancel` + `DRAIN_TIMEOUT` (§1 rule 2).
 - [x] **Visibility-lease claim**: on dequeue the worker stamps `next_retry_at = now()+VISIBILITY_TIMEOUT WHERE id=$1 AND status='pending' AND next_retry_at <= now()` before the HTTP call. _(in Deliverer.Process via ClaimPending; 0 rows ⇒ skip duplicate dequeue.)_
-- [x] Delivery **re-checks `sub.IsActive`** at delivery time → `final_failure` `"subscription deactivated"` (no DLQ push) if deactivated.
+- [x] Delivery **re-checks `sub.IsActive`** at delivery time → terminal `final_failure` `"subscription deactivated"` with `in_dlq=FALSE` if deactivated, so neither the direct path nor reconciler publishes an intentional drop.
 - [x] `SYNC_DELIVERY=false` (default): ingest `LPUSH`es + returns `202 Accepted`. _(verified: 202 → async delivery → success.)_
-- [x] `main.go` supervisor `errgroup` over the pool (+ later goroutines); SIGTERM stops dequeue, drains in-flight within `DRAIN_TIMEOUT`. _(errgroup.WithContext supervisor; gctx cancel → stop dequeue + http Shutdown + pool drain.)_
+- [x] `internal/lifecycle` supervisor over HTTP and background processes; SIGTERM stops dequeue, drains in-flight within `DRAIN_TIMEOUT`. _(Any process exit cancels peers; bounded HTTP shutdown and pool drain are unit-tested.)_
 - [x] `GET /api/v1/ready` upgraded to **worker-aware** readiness (pool running). _(verified: worker:ok.)_
 - [x] **Verify:** ingest → 202 → async delivery; SIGTERM drains in-flight instead of aborting. _(async verified; drain pattern unit-tested in Slice 11.)_
 
@@ -119,8 +119,8 @@ The keystone slice — proves the whole webhook concept end-to-end **synchronous
 - [x] **5 total attempts** (1 + 4) then `final_failure`. _(verified: 4 failed_attempt + final_failure.)_
 
 **Lease-based orphan recovery:**
-- [x] `worker/recovery`: startup + periodic (`RECOVERY_SCAN_INTERVAL`) scan re-enqueues `status='pending' AND next_retry_at <= now()`; in-flight rows hidden by their lease. _(plus deliverer self-heals an early-moved row via reschedule-on-not-due, so a skew-stuck row doesn't wait for the scan.)_
-- [x] testify test asserting an orphaned `pending` **retry** row is reclaimed/re-enqueued. _(integration test: orphan reclaimed, leased in-flight row excluded.)_
+- [x] `worker/recovery`: startup + periodic (`RECOVERY_SCAN_INTERVAL`) scan drains keyset pages until fewer than the configured batch remain; it re-enqueues due `pending` rows while live leases stay hidden. A `next_retry_at IS NULL` row older than `ORPHAN_THRESHOLD` is conditionally rearmed first, so concurrent scanners cannot both claim it. _(plus deliverer self-heals an early-moved row via reschedule-on-not-due.)_
+- [x] testify tests assert an orphaned `pending` **retry** row is reclaimed, more than one batch drains in one scan, and only threshold-old lease-less rows are rearmed. _(integration tests; leased in-flight row excluded.)_
 
 - [x] **Verify:** failing target → `failed_attempt` rows + scheduled retries + `final_failure` after the 5th; a lost-enqueue pending row is reclaimed. _(retry chain + recovery both verified; concurrent-CAS single-transition test is a Slice 11 high-risk test.)_
 
@@ -159,8 +159,8 @@ The keystone slice — proves the whole webhook concept end-to-end **synchronous
 *(Merged: the cache is the prerequisite for rotation + auto-disable, and the Adv §5 eviction matrix is one coherent unit. Build the cache, then wire every write path — including the Slice 2 CRUD paths — to evict it.)*
 
 **Read-through cache:**
-- [x] `infra/cache`: read-through `subscription:{uuid}` (JSON, `CACHE_TTL`); ingest/delivery read the sub via the cache. _(decorator over the repo; degrades to repo on Redis error.)_
-- [x] **Retrofit eviction** into the Slice 2 `PUT`/`DELETE` write paths (this is when the "evict on every write path" invariant becomes active). _(unified evictSubscription = cache + bucket + sem registries.)_
+- [x] `internal/subscription`: read-through `subscription:{uuid}` (JSON, `CACHE_TTL`); ingest/delivery read through the state boundary, which degrades to PostgreSQL on Redis error.
+- [x] Subscription CRUD and delivery outcomes own cache invalidation; delete and auto-disable retire rate/semaphore state. HTTP handlers and workers do not coordinate those mechanisms.
 
 **Secret rotation + dual-key grace:**
 - [x] `POST /api/v1/subscriptions/{id}/rotate-secret` (admin auth): new key, current → `previous_secret_key`, set `secret_rotated_at`; **evict cache**; return the new plaintext once. _(verified: new secret active immediately.)_

@@ -16,9 +16,13 @@ import (
 // for prompt shutdown.
 const brpopTimeout = 2 * time.Second
 
+type taskDequeuer interface {
+	Dequeue(ctx context.Context, timeout time.Duration) (string, error)
+}
+
 // Pool is the bounded goroutine pool that drains webhook:queue and delivers.
 type Pool struct {
-	queue        domain.TaskQueue
+	queue        taskDequeuer
 	deliverer    domain.Deliverer
 	concurrency  int
 	drainTimeout time.Duration
@@ -27,10 +31,7 @@ type Pool struct {
 
 // NewPool constructs a Pool. drainTimeout is the per-delivery hard deadline that
 // in-flight work gets after SIGTERM (via context.WithoutCancel).
-func NewPool(queue domain.TaskQueue, deliverer domain.Deliverer, concurrency int, drainTimeout time.Duration) *Pool {
-	if concurrency < 1 {
-		concurrency = 1
-	}
+func NewPool(queue taskDequeuer, deliverer domain.Deliverer, concurrency int, drainTimeout time.Duration) *Pool {
 	return &Pool{
 		queue:        queue,
 		deliverer:    deliverer,
@@ -43,7 +44,7 @@ func NewPool(queue domain.TaskQueue, deliverer domain.Deliverer, concurrency int
 func (p *Pool) Running() bool { return p.running.Load() }
 
 // Start runs the dequeue/deliver loop until ctx is cancelled, then drains
-// in-flight deliveries within drainTimeout. Two correctness rules (plan §1):
+// in-flight deliveries within drainTimeout. Two correctness rules:
 //
 //  1. A single failed delivery must NOT tear down the pool — we use a plain
 //     errgroup.Group (no derived cancel-on-error ctx) and never propagate a

@@ -3,6 +3,7 @@ package api
 import (
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"strconv"
 
@@ -25,6 +26,14 @@ func readJSON(w http.ResponseWriter, r *http.Request, dst any) bool {
 			writeError(w, http.StatusRequestEntityTooLarge, "request body too large")
 			return false
 		}
+		writeError(w, http.StatusBadRequest, "invalid JSON body")
+		return false
+	}
+	// Exactly one JSON value is allowed. Decoder.Decode by itself accepts a
+	// second value (for example, `{} {}`), which is almost never intentional and
+	// makes request interpretation ambiguous.
+	var trailing any
+	if err := dec.Decode(&trailing); !errors.Is(err, io.EOF) {
 		writeError(w, http.StatusBadRequest, "invalid JSON body")
 		return false
 	}

@@ -1,7 +1,7 @@
 // Package breaker implements a per-target-URL circuit breaker with a
 // Closed→Open→Half-Open FSM. A generation counter makes the half-open probe
 // authoritative: a request that began in one era and finishes in another carries
-// a stale token and cannot spuriously change state. See implementation plan §3.
+// a stale token and cannot spuriously change state.
 package breaker
 
 import (

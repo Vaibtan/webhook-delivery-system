@@ -4,8 +4,6 @@ import (
 	"context"
 	"log/slog"
 	"time"
-
-	"github.com/Vaibtan/webhook-delivery-system/internal/domain"
 )
 
 // cleanupRepo is the cleanup worker's view of the repository.
@@ -14,9 +12,8 @@ type cleanupRepo interface {
 	PruneIdempotency(ctx context.Context, ttl time.Duration) (int64, error)
 }
 
-// CleanupWorker is the SOLE retention-driven row deleter (plan Adv §1). It
-// deletes terminal, non-DLQ rows past the retention horizon and prunes the
-// idempotency table — never pending or in_dlq rows.
+// CleanupWorker is the sole retention-driven row deleter. It never deletes
+// pending or unacknowledged DLQ rows.
 type CleanupWorker struct {
 	repo           cleanupRepo
 	retention      time.Duration
@@ -26,25 +23,12 @@ type CleanupWorker struct {
 
 // NewCleanupWorker constructs the retention worker.
 func NewCleanupWorker(repo cleanupRepo, retention, idempotencyTTL, interval time.Duration) *CleanupWorker {
-	if interval <= 0 {
-		interval = time.Hour
-	}
 	return &CleanupWorker{repo: repo, retention: retention, idempotencyTTL: idempotencyTTL, interval: interval}
 }
 
 // Run cleans at startup then on the interval until ctx is cancelled.
 func (w *CleanupWorker) Run(ctx context.Context) error {
-	w.cleanup(ctx)
-	ticker := time.NewTicker(w.interval)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return nil
-		case <-ticker.C:
-			w.cleanup(ctx)
-		}
-	}
+	return runPeriodic(ctx, w.interval, true, w.cleanup)
 }
 
 func (w *CleanupWorker) cleanup(ctx context.Context) {
@@ -74,37 +58,29 @@ type reconcilerRepo interface {
 	ForceAckOldDLQ(ctx context.Context, maxAge time.Duration) ([]string, error)
 }
 
-// DLQReconciler keeps the Redis DLQ LIST in sync with the authoritative in_dlq
-// flag and force-acks aged entries (plan Adv §1). It mutates flags only — it
-// never deletes rows, keeping CleanupWorker the sole deleter.
+type deadLetterIndex interface {
+	Push(ctx context.Context, deliveryLogID string) error
+	Remove(ctx context.Context, deliveryLogID string) error
+	List(ctx context.Context) ([]string, error)
+}
+
+// DLQReconciler repairs the Redis DLQ index from PostgreSQL and force-acks aged
+// entries. It never deletes delivery rows.
 type DLQReconciler struct {
 	repo     reconcilerRepo
-	dlq      domain.DeadLetterQueue
+	dlq      deadLetterIndex
 	maxAge   time.Duration
 	interval time.Duration
 }
 
 // NewDLQReconciler constructs the reconciler.
-func NewDLQReconciler(repo reconcilerRepo, dlq domain.DeadLetterQueue, maxAge, interval time.Duration) *DLQReconciler {
-	if interval <= 0 {
-		interval = 5 * time.Minute
-	}
+func NewDLQReconciler(repo reconcilerRepo, dlq deadLetterIndex, maxAge, interval time.Duration) *DLQReconciler {
 	return &DLQReconciler{repo: repo, dlq: dlq, maxAge: maxAge, interval: interval}
 }
 
 // Run reconciles at startup then on the interval until ctx is cancelled.
 func (w *DLQReconciler) Run(ctx context.Context) error {
-	w.reconcile(ctx)
-	ticker := time.NewTicker(w.interval)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return nil
-		case <-ticker.C:
-			w.reconcile(ctx)
-		}
-	}
+	return runPeriodic(ctx, w.interval, true, w.reconcile)
 }
 
 func (w *DLQReconciler) reconcile(ctx context.Context) {

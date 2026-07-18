@@ -1,6 +1,6 @@
 // Package signature implements the canonical HMAC-SHA256 signing scheme used in
 // both directions (inbound verification and outbound delivery), plus
-// deterministic JSON canonicalization. See implementation plan §5/§7/§8.
+// deterministic JSON canonicalization.
 //
 // One canonical grammar, used everywhere:
 //

@@ -5,8 +5,6 @@ import (
 	"fmt"
 
 	"github.com/redis/go-redis/v9"
-
-	"github.com/Vaibtan/webhook-delivery-system/internal/domain"
 )
 
 // KeyDLQ is the Redis key for the dead-letter LIST. It is a fast operator-facing
@@ -14,7 +12,7 @@ import (
 // repairs any divergence).
 const KeyDLQ = "webhook:dlq"
 
-// DLQ implements domain.DeadLetterQueue over a Redis LIST.
+// DLQ indexes permanently failed delivery IDs in a Redis LIST.
 type DLQ struct {
 	rdb *redis.Client
 	key string
@@ -24,8 +22,6 @@ type DLQ struct {
 func NewDLQ(rdb *redis.Client) *DLQ {
 	return &DLQ{rdb: rdb, key: KeyDLQ}
 }
-
-var _ domain.DeadLetterQueue = (*DLQ)(nil)
 
 // Push LPUSHes a final_failure row id onto the DLQ (best-effort, post-commit).
 func (d *DLQ) Push(ctx context.Context, deliveryLogID string) error {

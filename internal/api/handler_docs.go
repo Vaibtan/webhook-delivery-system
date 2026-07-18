@@ -10,9 +10,7 @@ import (
 //go:embed openapi.json
 var openAPISpec []byte
 
-// swaggerUIHTML is a minimal page that loads Swagger UI from a CDN and points it
-// at the embedded spec. This satisfies the assignment's "interactive UI"
-// requirement (raw JSON alone is not a UI).
+// swaggerUIHTML loads Swagger UI from a CDN and points it at the embedded spec.
 const swaggerUIHTML = `<!DOCTYPE html>
 <html lang="en">
 <head>

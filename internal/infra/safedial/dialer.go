@@ -1,6 +1,6 @@
 // Package safedial provides SSRF-resistant outbound dialing and a hardened
 // http.Client. Destination hostnames are resolved and every candidate IP is
-// classified against blocked ranges before any connection is made. See plan §6.
+// classified against blocked ranges before any connection is made.
 package safedial
 
 import (

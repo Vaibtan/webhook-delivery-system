@@ -159,33 +159,55 @@ func Load() (*Config, error) {
 // intentionally NOT required here: the admin route group fails closed at request
 // time if it is unset, while health/ready/ingest/docs remain usable.
 func (c *Config) validate() error {
-	if c.DatabaseURL == "" {
-		return fmt.Errorf("config: DATABASE_URL is required")
+	var errs []error
+	check := func(ok bool, format string, args ...any) {
+		if !ok {
+			errs = append(errs, fmt.Errorf(format, args...))
+		}
 	}
-	if c.RedisURL == "" {
-		return fmt.Errorf("config: REDIS_URL is required")
-	}
-	if c.WorkerConcurrency < 1 {
-		return fmt.Errorf("config: WORKER_CONCURRENCY must be >= 1, got %d", c.WorkerConcurrency)
-	}
-	if c.PerSubConcurrency < 1 {
-		return fmt.Errorf("config: PER_SUB_CONCURRENCY must be >= 1, got %d", c.PerSubConcurrency)
-	}
-	if c.MaxRetryAttempts < 1 {
-		return fmt.Errorf("config: MAX_RETRY_ATTEMPTS must be >= 1, got %d", c.MaxRetryAttempts)
-	}
-	// These windows are the single source of truth for signature verification — the
-	// API layer trusts them directly rather than re-defaulting, so guard them here.
-	if c.SignatureDriftWindow <= 0 {
-		return fmt.Errorf("config: SIGNATURE_DRIFT_WINDOW must be > 0, got %s", c.SignatureDriftWindow)
-	}
-	if c.SecretGraceWindow < 0 {
-		return fmt.Errorf("config: SECRET_GRACE_WINDOW must be >= 0, got %s", c.SecretGraceWindow)
+
+	check(strings.TrimSpace(c.DatabaseURL) != "", "DATABASE_URL is required")
+	check(strings.TrimSpace(c.RedisURL) != "", "REDIS_URL is required")
+	port, portErr := strconv.Atoi(c.Port)
+	check(portErr == nil && port >= 1 && port <= 65535, "PORT must be an integer in [1, 65535], got %q", c.Port)
+
+	check(c.WebhookTimeout > 0, "WEBHOOK_TIMEOUT must be > 0, got %s", c.WebhookTimeout)
+	check(c.WorkerConcurrency >= 1, "WORKER_CONCURRENCY must be >= 1, got %d", c.WorkerConcurrency)
+	check(c.PerSubConcurrency >= 1, "PER_SUB_CONCURRENCY must be >= 1, got %d", c.PerSubConcurrency)
+	check(c.DrainTimeout > 0, "DRAIN_TIMEOUT must be > 0, got %s", c.DrainTimeout)
+	check(c.DrainTimeout >= c.WebhookTimeout, "DRAIN_TIMEOUT must be >= WEBHOOK_TIMEOUT (%s), got %s", c.WebhookTimeout, c.DrainTimeout)
+
+	check(c.MaxRetryAttempts >= 1, "MAX_RETRY_ATTEMPTS must be >= 1, got %d", c.MaxRetryAttempts)
+	check(c.RetryBaseDelay > 0, "RETRY_BASE_DELAY must be > 0, got %s", c.RetryBaseDelay)
+	check(c.RetryMaxDelay > 0, "RETRY_MAX_DELAY must be > 0, got %s", c.RetryMaxDelay)
+	check(c.RetryMaxDelay >= c.RetryBaseDelay, "RETRY_MAX_DELAY must be >= RETRY_BASE_DELAY (%s), got %s", c.RetryBaseDelay, c.RetryMaxDelay)
+
+	check(c.VisibilityTimeout > c.WebhookTimeout, "VISIBILITY_TIMEOUT must be > WEBHOOK_TIMEOUT (%s), got %s", c.WebhookTimeout, c.VisibilityTimeout)
+	check(c.OrphanThreshold >= c.VisibilityTimeout, "ORPHAN_THRESHOLD must be >= VISIBILITY_TIMEOUT (%s), got %s", c.VisibilityTimeout, c.OrphanThreshold)
+	check(c.RecoveryScanInterval > 0, "RECOVERY_SCAN_INTERVAL must be > 0, got %s", c.RecoveryScanInterval)
+
+	check(c.LogRetention > 0, "LOG_RETENTION_HOURS must be > 0, got %s", c.LogRetention)
+	check(c.DLQMaxAge > 0, "DLQ_MAX_AGE must be > 0, got %s", c.DLQMaxAge)
+	check(c.IdempotencyTTL > 0, "IDEMPOTENCY_TTL must be > 0, got %s", c.IdempotencyTTL)
+	check(c.IdempotencyTTL >= c.SignatureDriftWindow, "IDEMPOTENCY_TTL must be >= SIGNATURE_DRIFT_WINDOW (%s), got %s", c.SignatureDriftWindow, c.IdempotencyTTL)
+
+	check(c.CacheTTL > 0, "CACHE_TTL must be > 0, got %s", c.CacheTTL)
+	check(c.RegistryIdleTTL > c.WebhookTimeout, "REGISTRY_IDLE_TTL must be > WEBHOOK_TIMEOUT (%s), got %s", c.WebhookTimeout, c.RegistryIdleTTL)
+	check(c.RateLimitPerSec > 0, "RATE_LIMIT_PER_SEC must be > 0, got %d", c.RateLimitPerSec)
+	check(c.RateLimitBurst > 0, "RATE_LIMIT_BURST must be > 0, got %d", c.RateLimitBurst)
+
+	check(c.BreakerThreshold > 0, "BREAKER_THRESHOLD must be > 0, got %d", c.BreakerThreshold)
+	check(c.BreakerResetTimeout > 0, "BREAKER_RESET_TIMEOUT must be > 0, got %s", c.BreakerResetTimeout)
+	check(c.AutoDisableThreshold > 0, "AUTO_DISABLE_THRESHOLD must be > 0, got %d", c.AutoDisableThreshold)
+
+	check(c.SignatureDriftWindow > 0, "SIGNATURE_DRIFT_WINDOW must be > 0, got %s", c.SignatureDriftWindow)
+	check(c.SecretGraceWindow >= 0, "SECRET_GRACE_WINDOW must be >= 0, got %s", c.SecretGraceWindow)
+
+	if len(errs) > 0 {
+		return fmt.Errorf("config: invalid values: %w", errors.Join(errs...))
 	}
 	return nil
 }
-
-// --- env parsing helpers (stdlib only) -------------------------------------
 
 func getEnv(key, def string) string {
 	if v := os.Getenv(key); v != "" {
@@ -232,8 +254,7 @@ func parseEnvDuration(key string, def time.Duration) (time.Duration, error) {
 	return d, nil
 }
 
-// parseEnvHours parses an integer number of hours (e.g. LOG_RETENTION_HOURS=72)
-// into a Duration. The env var is an int for Python parity; we expose a Duration.
+// parseEnvHours parses an integer number of hours into a Duration.
 func parseEnvHours(key string, def time.Duration) (time.Duration, error) {
 	v := strings.TrimSpace(os.Getenv(key))
 	if v == "" {

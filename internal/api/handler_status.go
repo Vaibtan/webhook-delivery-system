@@ -8,10 +8,8 @@ import (
 	"github.com/Vaibtan/webhook-delivery-system/internal/domain"
 )
 
-// statusResponse mirrors the Python get_webhook_status shape, enhanced with
-// replay_number ordering. The top-level "current" fields come from the latest
-// attempt of the latest chain (MAX(replay_number)) so a replay's progress is
-// never masked by the original chain's old final_failure (plan §0).
+// statusResponse selects current fields from the latest attempt of the latest
+// replay chain, so an earlier chain cannot mask a replay's progress.
 type statusResponse struct {
 	WebhookID      string          `json:"webhook_id"`
 	SubscriptionID string          `json:"subscription_id"`
@@ -49,7 +47,7 @@ type statistics struct {
 // statistics block. Admin auth.
 func (s *Server) handleWebhookStatus(w http.ResponseWriter, r *http.Request) {
 	webhookID := r.PathValue("webhook_id")
-	logs, err := s.opts.DeliveryLogs.ListByWebhookID(r.Context(), webhookID)
+	logs, err := s.opts.DeliveryStatus.ListByWebhookID(r.Context(), webhookID)
 	if err != nil {
 		writeDomainError(w, r, err)
 		return
@@ -112,7 +110,7 @@ func (s *Server) handleMetricsSummary(w http.ResponseWriter, r *http.Request) {
 	hours := parseHours(r, 24)
 	since := time.Now().Add(-time.Duration(hours) * time.Hour)
 
-	counts, err := s.opts.DeliveryLogs.CountByStatusSince(r.Context(), since)
+	counts, err := s.opts.DeliveryStatus.CountByStatusSince(r.Context(), since)
 	if err != nil {
 		writeDomainError(w, r, err)
 		return

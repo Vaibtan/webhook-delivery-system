@@ -1,7 +1,4 @@
-// Package worker contains the background delivery engine: the deliverer, worker
-// pool, retry scheduler, recovery, cleanup, and DLQ reconciler. In Slice 3 only
-// the deliverer's synchronous path exists; later slices add the async pool,
-// retries, breaker/rate-limit gating, and DLQ lifecycle.
+// Package worker contains the background delivery engine.
 package worker
 
 import (
@@ -13,15 +10,18 @@ import (
 	"log/slog"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/Vaibtan/webhook-delivery-system/internal/domain"
 	"github.com/Vaibtan/webhook-delivery-system/internal/infra/signature"
 )
 
 const (
-	maxErrorDetailLen = 512
-	userAgent         = "webhook-delivery-service/1.0"
+	maxErrorDetailLen  = 512
+	userAgent          = "webhook-delivery-service/1.0"
+	concurrencyBackoff = 3 * time.Second
 )
 
 // DelivererConfig holds tunables for the deliverer.
@@ -36,9 +36,6 @@ type DelivererConfig struct {
 	// BreakerResetTimeout is how far ahead a breaker-denied row is rescheduled
 	// (so it becomes due ~when the breaker admits its next probe).
 	BreakerResetTimeout time.Duration
-	// ConcurrencyBackoff is the small requeue delay when a subscription is at its
-	// in-flight limit.
-	ConcurrencyBackoff time.Duration
 	// AutoDisableThreshold is the consecutive-final-failure count that disables a
 	// subscription (is_active=FALSE).
 	AutoDisableThreshold int
@@ -66,116 +63,62 @@ type MetricsRecorder interface {
 
 // deliveryStore is the subset of the delivery-log persistence port the Deliverer
 // drives through the CAS lifecycle. The concrete *store.DeliveryLogRepo satisfies
-// it; narrowing keeps the Deliverer's test surface to the methods it actually
-// uses instead of the full 20-method domain.DeliveryLogRepository.
+// it; narrowing keeps the Deliverer's test surface to the methods it uses.
 type deliveryStore interface {
 	GetByID(ctx context.Context, id string) (*domain.DeliveryLog, error)
 	ClaimPending(ctx context.Context, id string, lease time.Duration) (bool, error)
-	MarkSuccess(ctx context.Context, id, subscriptionID string, httpStatus int) (bool, error)
-	MarkFinalFailure(ctx context.Context, id string, httpStatus *int, errorDetails string) (bool, error)
-	FinalizeFailure(ctx context.Context, id, subscriptionID string, httpStatus *int, errorDetails string, disableThreshold int) (won bool, disabled bool, err error)
+	MarkDropped(ctx context.Context, id string, errorDetails string) (bool, error)
 	FailAndScheduleRetry(ctx context.Context, prevID string, httpStatus *int, errorDetails string, nextRetryAt time.Time) (successorID string, won bool, err error)
 	RescheduleSamePending(ctx context.Context, id string, at time.Time) (bool, error)
 }
 
-// subscriptionReader is the read-only subset of the subscription port the
-// Deliverer needs — it only loads a subscription to deliver to it.
-type subscriptionReader interface {
+// subscriptionState owns subscription reads and the cross-table consequences
+// of terminal delivery transitions.
+type subscriptionState interface {
 	GetByID(ctx context.Context, id string) (*domain.Subscription, error)
+	RecordDeliverySuccess(ctx context.Context, id, subscriptionID string, httpStatus int) (won bool, err error)
+	RecordFinalFailure(ctx context.Context, id, subscriptionID string, httpStatus *int, errorDetails string, disableThreshold int) (won, disabled bool, err error)
 }
 
-// no-op collaborators are the defaults for the optional Deliverer dependencies,
-// so Process can invoke them unconditionally. Sync mode, for instance, wires
-// neither a breaker nor per-sub concurrency: the no-op breaker always allows and
-// the no-op permit always acquires, preserving "no gating" without nil-guards.
-type noopBreaker struct{}
+type deliveryScheduler interface {
+	Schedule(ctx context.Context, deliveryLogID string, at time.Time) error
+}
 
-func (noopBreaker) Allow() (bool, int64) { return true, 0 }
-func (noopBreaker) RecordSuccess(int64)  {}
-func (noopBreaker) RecordFailure(int64)  {}
+type deadLetterWriter interface {
+	Push(ctx context.Context, deliveryLogID string) error
+}
 
-type noopSem struct{}
-
-func (noopSem) TryAcquire() bool { return true }
-func (noopSem) Release()         {}
-
-type noopMetrics struct{}
-
-func (noopMetrics) RecordDelivery(time.Duration, bool) {}
+// DeliveryControls are the required runtime controls around an HTTP attempt.
+type DeliveryControls struct {
+	BreakerFor   func(targetURL string) Breaker
+	SemaphoreFor func(subscriptionID string) Sem
+	Metrics      MetricsRecorder
+}
 
 // Deliverer performs one delivery attempt against a delivery-log row and applies
 // the CAS-guarded status transition. It satisfies domain.Deliverer.
 type Deliverer struct {
 	logs   deliveryStore
-	subs   subscriptionReader
-	sched  domain.RetryScheduler
-	dlq    domain.DeadLetterQueue
+	subs   subscriptionState
+	sched  deliveryScheduler
+	dlq    deadLetterWriter
 	client *http.Client
 	cfg    DelivererConfig
 
 	breakerFor func(targetURL string) Breaker
 	semFor     func(subscriptionID string) Sem
-	evictSub   func(subscriptionID string)
 	metrics    MetricsRecorder
 }
 
-// Option configures optional Deliverer collaborators at construction. Absent
-// options default to no-ops, so NewDeliverer yields a fully-wired, immutable
-// Deliverer: no post-construction setters, no temporal coupling, and no shared
-// mutable fields read by pool goroutines.
-type Option func(*Deliverer)
-
-// WithBreakerRegistry wires the per-URL circuit-breaker lookup.
-func WithBreakerRegistry(fn func(targetURL string) Breaker) Option {
-	return func(d *Deliverer) { d.breakerFor = fn }
-}
-
-// WithConcurrencyRegistry wires the per-subscription semaphore lookup.
-func WithConcurrencyRegistry(fn func(subscriptionID string) Sem) Option {
-	return func(d *Deliverer) { d.semFor = fn }
-}
-
-// WithEvictHook wires the cache/registry eviction called on auto-disable.
-func WithEvictHook(fn func(subscriptionID string)) Option {
-	return func(d *Deliverer) { d.evictSub = fn }
-}
-
-// WithMetrics wires the delivery metrics recorder.
-func WithMetrics(m MetricsRecorder) Option {
-	return func(d *Deliverer) { d.metrics = m }
-}
-
-// NewDeliverer constructs a fully-wired Deliverer over the given store, retry
-// scheduler, DLQ, and (hardened, SSRF-safe) HTTP client. Optional collaborators
-// (breaker, per-sub concurrency, eviction hook, metrics) are supplied via Option
-// and default to no-ops.
-func NewDeliverer(logs deliveryStore, subs subscriptionReader, sched domain.RetryScheduler, dlq domain.DeadLetterQueue, client *http.Client, cfg DelivererConfig, opts ...Option) *Deliverer {
-	if cfg.VisibilityTimeout <= 0 {
-		cfg.VisibilityTimeout = 60 * time.Second
-	}
-	if cfg.MaxRetryAttempts <= 0 {
-		cfg.MaxRetryAttempts = 5
-	}
-	if cfg.BreakerResetTimeout <= 0 {
-		cfg.BreakerResetTimeout = 30 * time.Second
-	}
-	if cfg.ConcurrencyBackoff <= 0 {
-		cfg.ConcurrencyBackoff = 3 * time.Second
-	}
-	if cfg.AutoDisableThreshold <= 0 {
-		cfg.AutoDisableThreshold = 5
-	}
-	d := &Deliverer{
+// NewDeliverer constructs an immutable Deliverer from validated configuration
+// and explicit runtime controls.
+func NewDeliverer(logs deliveryStore, subs subscriptionState, sched deliveryScheduler, dlq deadLetterWriter, client *http.Client, cfg DelivererConfig, controls DeliveryControls) *Deliverer {
+	return &Deliverer{
 		logs: logs, subs: subs, sched: sched, dlq: dlq, client: client, cfg: cfg,
-		breakerFor: func(string) Breaker { return noopBreaker{} },
-		semFor:     func(string) Sem { return noopSem{} },
-		evictSub:   func(string) {},
-		metrics:    noopMetrics{},
+		breakerFor: controls.BreakerFor,
+		semFor:     controls.SemaphoreFor,
+		metrics:    controls.Metrics,
 	}
-	for _, opt := range opts {
-		opt(d)
-	}
-	return d
 }
 
 var _ domain.Deliverer = (*Deliverer)(nil)
@@ -196,7 +139,7 @@ func (d *Deliverer) Process(ctx context.Context, deliveryLogID string) error {
 		return nil // already finalized by someone else
 	}
 
-	// Visibility-lease claim (plan §0/§1): the conditional CAS is the mutual-
+	// The visibility-lease CAS is the mutual-
 	// exclusion point. 0 rows ⇒ not due / lease live / already handled ⇒ this is
 	// a duplicate dequeue, so skip without delivering.
 	claimed, err := d.logs.ClaimPending(ctx, log.ID, d.cfg.VisibilityTimeout)
@@ -223,7 +166,7 @@ func (d *Deliverer) Process(ctx context.Context, deliveryLogID string) error {
 	// Re-check is_active at delivery time (the sub may have been deactivated
 	// between ingest and delivery). Intentional drop → final_failure, no DLQ.
 	if !sub.IsActive {
-		if _, err := d.logs.MarkFinalFailure(ctx, log.ID, nil, "subscription deactivated"); err != nil {
+		if _, err := d.logs.MarkDropped(ctx, log.ID, "subscription deactivated"); err != nil {
 			return fmt.Errorf("deliver: mark deactivated: %w", err)
 		}
 		return nil
@@ -235,7 +178,7 @@ func (d *Deliverer) Process(ctx context.Context, deliveryLogID string) error {
 	// token is never taken and then abandoned.
 	sem := d.semFor(sub.ID)
 	if !sem.TryAcquire() {
-		d.rescheduleNoAttempt(ctx, log.ID, time.Now().Add(d.cfg.ConcurrencyBackoff), "per-sub concurrency limit")
+		d.rescheduleNoAttempt(ctx, log.ID, time.Now().Add(concurrencyBackoff), "per-sub concurrency limit")
 		return nil
 	}
 	defer sem.Release()
@@ -260,7 +203,8 @@ func (d *Deliverer) Process(ctx context.Context, deliveryLogID string) error {
 	}
 
 	if success {
-		if _, err := d.logs.MarkSuccess(ctx, log.ID, sub.ID, *httpStatus); err != nil {
+		_, err := d.subs.RecordDeliverySuccess(ctx, log.ID, sub.ID, *httpStatus)
+		if err != nil {
 			return fmt.Errorf("deliver: mark success: %w", err)
 		}
 		return nil
@@ -299,9 +243,8 @@ func (d *Deliverer) rescheduleIfNotDue(ctx context.Context, id string) {
 	}
 }
 
-// handleFailure applies the failure lifecycle: schedule a retry while attempts
-// remain (failed→successor tx + post-commit ZADD), else mark final_failure.
-// (Slice 6 adds the DLQ flag/LPUSH on final_failure.)
+// handleFailure schedules a successor while attempts remain, otherwise it
+// atomically marks the row terminal and updates subscription failure state.
 func (d *Deliverer) handleFailure(ctx context.Context, log *domain.DeliveryLog, httpStatus *int, errDetail string) error {
 	if log.AttemptNumber < d.cfg.MaxRetryAttempts {
 		nextAt := time.Now().Add(retryDelay(log.AttemptNumber, d.cfg.RetryBaseDelay, d.cfg.RetryMaxDelay))
@@ -324,7 +267,9 @@ func (d *Deliverer) handleFailure(ctx context.Context, log *domain.DeliveryLog, 
 	// Attempt budget exhausted → terminal. final_failure + in_dlq AND the
 	// consecutive_failures bump (auto-disable) commit in one tx; the LPUSH and
 	// cache eviction are post-commit best-effort.
-	won, disabled, err := d.logs.FinalizeFailure(ctx, log.ID, log.SubscriptionID, httpStatus, errDetail, d.cfg.AutoDisableThreshold)
+	won, disabled, err := d.subs.RecordFinalFailure(
+		ctx, log.ID, log.SubscriptionID, httpStatus, errDetail, d.cfg.AutoDisableThreshold,
+	)
 	if err != nil {
 		return fmt.Errorf("deliver: finalize failure: %w", err)
 	}
@@ -335,7 +280,6 @@ func (d *Deliverer) handleFailure(ctx context.Context, log *domain.DeliveryLog, 
 	}
 	if disabled {
 		slog.Warn("deliver: subscription auto-disabled after consecutive failures", "subscription_id", log.SubscriptionID)
-		d.evictSub(log.SubscriptionID)
 	}
 	return nil
 }
@@ -389,10 +333,15 @@ func (d *Deliverer) attempt(ctx context.Context, log *domain.DeliveryLog, sub *d
 	return &status, truncate(detail, maxErrorDetailLen), latency
 }
 
-// truncate caps s at n bytes (rune-safe enough for error snippets).
+// truncate returns valid UTF-8 capped at n bytes for PostgreSQL text fields.
 func truncate(s string, n int) string {
+	s = strings.ToValidUTF8(s, "�")
 	if len(s) <= n {
 		return s
 	}
-	return s[:n]
+	s = s[:n]
+	for !utf8.ValidString(s) {
+		s = s[:len(s)-1]
+	}
+	return s
 }

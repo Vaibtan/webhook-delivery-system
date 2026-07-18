@@ -1,7 +1,7 @@
 // Package semaphore is a counting semaphore with non-blocking acquisition, used
 // to cap in-flight deliveries per subscription (noisy-neighbor protection). The
 // non-blocking TryAcquire lets a worker requeue instead of parking, avoiding
-// head-of-line starvation (plan Adv §3).
+// head-of-line starvation.
 package semaphore
 
 // Semaphore is a bounded, concurrency-safe permit holder.
@@ -11,9 +11,6 @@ type Semaphore struct {
 
 // New constructs a semaphore allowing n concurrent holders (n>=1).
 func New(n int) *Semaphore {
-	if n < 1 {
-		n = 1
-	}
 	return &Semaphore{tokens: make(chan struct{}, n)}
 }
 
@@ -29,8 +26,5 @@ func (s *Semaphore) TryAcquire() bool {
 
 // Release returns a permit. Safe to call only after a successful TryAcquire.
 func (s *Semaphore) Release() {
-	select {
-	case <-s.tokens:
-	default:
-	}
+	<-s.tokens
 }

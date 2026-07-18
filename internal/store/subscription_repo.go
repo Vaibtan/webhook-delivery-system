@@ -10,8 +10,8 @@ import (
 	"github.com/Vaibtan/webhook-delivery-system/internal/domain"
 )
 
-// SubscriptionRepo implements domain.SubscriptionRepository over PostgreSQL with
-// raw SQL (no ORM). Listing uses keyset/cursor pagination.
+// SubscriptionRepo persists subscriptions in PostgreSQL. Listing uses keyset
+// pagination.
 type SubscriptionRepo struct {
 	pool *pgxpool.Pool
 }
@@ -20,9 +20,6 @@ type SubscriptionRepo struct {
 func NewSubscriptionRepo(pool *pgxpool.Pool) *SubscriptionRepo {
 	return &SubscriptionRepo{pool: pool}
 }
-
-// Compile-time interface check.
-var _ domain.SubscriptionRepository = (*SubscriptionRepo)(nil)
 
 // subColumns is the canonical SELECT column list, in scan order.
 const subColumns = `id, target_url, secret_key, previous_secret_key, secret_rotated_at,

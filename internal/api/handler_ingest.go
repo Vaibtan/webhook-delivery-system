@@ -1,6 +1,7 @@
 package api
 
 import (
+	"encoding/json"
 	"errors"
 	"io"
 	"math"
@@ -37,12 +38,6 @@ func (s *Server) handleIngest(w http.ResponseWriter, r *http.Request) {
 	}
 	if !sub.IsActive {
 		writeError(w, http.StatusForbidden, "subscription is inactive")
-		return
-	}
-
-	// Per-subscription rate limit (load shedding) — fail fast before body read.
-	if !s.opts.RateLimitAllow(sub.ID) {
-		writeError(w, http.StatusTooManyRequests, "rate limit exceeded")
 		return
 	}
 
@@ -83,8 +78,26 @@ func (s *Server) handleIngest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Event-type filter (query param, Python parity). Empty filter = all events.
+	// Charge the subscription's quota only after authentication. An attacker who
+	// merely learns a subscription UUID must not be able to consume its bucket.
+	if !s.opts.RateLimitAllow(sub.ID) {
+		writeError(w, http.StatusTooManyRequests, "rate limit exceeded")
+		return
+	}
+
+	// JSONB storage requires exactly one valid JSON value. Reject malformed
+	// payloads at the trust boundary instead of surfacing a PostgreSQL 500.
+	if !json.Valid(body) {
+		writeError(w, http.StatusBadRequest, "payload must be valid JSON")
+		return
+	}
+
+	// An empty subscription filter accepts all event types.
 	eventType := r.URL.Query().Get("event_type")
+	if err := domain.ValidateEventType(eventType); err != nil {
+		writeDomainError(w, r, err)
+		return
+	}
 	if !sub.AcceptsEvent(eventType) {
 		writeJSON(w, http.StatusAccepted, ingestResponse{Status: "ignored"})
 		return
@@ -96,7 +109,7 @@ func (s *Server) handleIngest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	result, err := s.opts.DeliveryLogs.IngestPending(r.Context(), domain.IngestParams{
+	result, err := s.opts.DeliveryIngest.IngestPending(r.Context(), domain.IngestParams{
 		SubscriptionID: sub.ID,
 		IdempotencyKey: idempotencyKey,
 		WebhookID:      webhookID,
@@ -121,7 +134,7 @@ func (s *Server) handleIngest(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		status := "delivered"
-		if d, derr := s.opts.DeliveryLogs.GetByID(r.Context(), result.DeliveryLogID); derr == nil {
+		if d, derr := s.opts.DeliveryIngest.GetByID(r.Context(), result.DeliveryLogID); derr == nil {
 			status = string(d.Status)
 		}
 		writeJSON(w, http.StatusOK, ingestResponse{WebhookID: result.WebhookID, DeliveryID: result.DeliveryLogID, Status: status})
@@ -138,7 +151,7 @@ func (s *Server) handleIngest(w http.ResponseWriter, r *http.Request) {
 
 // verifyIngest enforces the drift window then HMAC-verifies the raw body against
 // the current secret, falling back to the previous secret within the grace
-// window (rotation, Slice 8). Returns ErrTimestampOutOfWindow / ErrSignatureInvalid.
+// window. Returns ErrTimestampOutOfWindow or ErrSignatureInvalid.
 func (s *Server) verifyIngest(sub *domain.Subscription, body []byte, timestamp, idempotencyKey, sig string) error {
 	ts, err := strconv.ParseInt(timestamp, 10, 64)
 	if err != nil {

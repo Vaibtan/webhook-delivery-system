@@ -9,7 +9,7 @@ func (s *Server) handleReplay(w http.ResponseWriter, r *http.Request) {
 	subID := pathID(r)
 	webhookID := r.PathValue("webhook_id")
 
-	claimedID, newID, ok, err := s.opts.DeliveryLogs.ReplayDLQ(r.Context(), subID, webhookID)
+	claimedID, newID, ok, err := s.opts.DeliveryDLQ.ReplayDLQ(r.Context(), subID, webhookID)
 	if err != nil {
 		writeDomainError(w, r, err)
 		return
@@ -39,7 +39,7 @@ func (s *Server) handleAckDLQ(w http.ResponseWriter, r *http.Request) {
 	subID := pathID(r)
 	webhookID := r.PathValue("webhook_id")
 
-	claimedID, ok, err := s.opts.DeliveryLogs.AckDLQ(r.Context(), subID, webhookID)
+	claimedID, ok, err := s.opts.DeliveryDLQ.AckDLQ(r.Context(), subID, webhookID)
 	if err != nil {
 		writeDomainError(w, r, err)
 		return

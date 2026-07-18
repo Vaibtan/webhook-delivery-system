@@ -29,13 +29,27 @@ const defaultMaxBodyBytes = 1 << 20 // 1 MiB
 // declares only the methods the handlers actually call. The concrete
 // store/queue adapters satisfy them implicitly.
 type (
-	// deliveryLogStore is what the handlers use of the delivery-log port.
-	deliveryLogStore interface {
+	subscriptionStore interface {
+		Create(ctx context.Context, sub *domain.Subscription) error
+		GetByID(ctx context.Context, id string) (*domain.Subscription, error)
+		List(ctx context.Context, limit int, after *domain.Cursor) (domain.Page[*domain.Subscription], error)
+		Update(ctx context.Context, sub *domain.Subscription) error
+		Delete(ctx context.Context, id string) error
+		RotateSecret(ctx context.Context, id, newSecret string) (*domain.Subscription, error)
+	}
+
+	deliveryIngestStore interface {
 		GetByID(ctx context.Context, id string) (*domain.DeliveryLog, error)
 		IngestPending(ctx context.Context, p domain.IngestParams) (domain.IngestResult, error)
+	}
+
+	deliveryStatusStore interface {
 		ListByWebhookID(ctx context.Context, webhookID string) ([]*domain.DeliveryLog, error)
 		ListBySubscription(ctx context.Context, subscriptionID string, limit int) ([]*domain.DeliveryLog, error)
 		CountByStatusSince(ctx context.Context, since time.Time) (domain.StatusCounts, error)
+	}
+
+	deliveryDLQStore interface {
 		AckDLQ(ctx context.Context, subscriptionID, webhookID string) (claimedID string, ok bool, err error)
 		ReplayDLQ(ctx context.Context, subscriptionID, webhookID string) (claimedID, newID string, ok bool, err error)
 	}
@@ -62,23 +76,23 @@ type Options struct {
 	// Liveness probes for /health.
 	PingDB    func(ctx context.Context) error
 	PingRedis func(ctx context.Context) error
-	// WorkerReady reports whether the worker pool is running (worker-aware /ready).
-	// OPTIONAL: nil in sync mode ⇒ readiness falls back to dependency reachability.
+	// WorkerReady reports whether the worker pool is running.
 	WorkerReady func() bool
 
 	// Persistence.
-	Subscriptions domain.SubscriptionRepository
-	DeliveryLogs  deliveryLogStore
+	Subscriptions  subscriptionStore
+	DeliveryIngest deliveryIngestStore
+	DeliveryStatus deliveryStatusStore
+	DeliveryDLQ    deliveryDLQStore
 
 	// Delivery pipeline.
-	SyncDelivery bool             // deliver in-request instead of enqueuing
+	SyncDelivery bool             // make the first attempt in-request; retries remain async
 	Deliverer    domain.Deliverer // used by the sync path
 	TaskQueue    taskQueue        // async enqueue + queue depth
 	DLQ          deadLetterQueue  // dead-letter LIST index (replay/ack LREM, depth)
 
-	// Per-subscription gating and invalidation.
-	RateLimitAllow    func(subscriptionID string) bool // per-sub token-bucket admission
-	EvictSubscription func(subscriptionID string)      // delete-on-write: cache + registries
+	// Per-subscription admission.
+	RateLimitAllow func(subscriptionID string) bool
 
 	// Observability.
 	Metrics       MetricsProvider

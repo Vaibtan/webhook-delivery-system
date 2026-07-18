@@ -27,8 +27,9 @@ A production-grade, portfolio-quality port of the Python webhook delivery servic
 > 3. **Auto-disable counter is folded into combined transactional store methods**: `MarkSuccess` (CAS success
 >    + reset `consecutive_failures`, one tx) and `FinalizeFailure` (final_failure + `in_dlq` + counter++ +
 >    auto-disable at threshold, one tx). `MarkFinalFailure` is retained only for the intentional
->    "subscription deactivated" drop (no counter). Cache eviction on auto-disable runs via a single
->    `evictSubscription` hook (cache + bucket + semaphore registries) shared by the API write paths and the deliverer.
+>    "subscription deactivated" drop (no counter). `internal/subscription.State` owns those semantic
+>    delivery outcomes together with cache invalidation and derived rate/semaphore resets; API and worker callers
+>    no longer coordinate those consequences through callbacks.
 > 4. **DLQ reconciler re-push is symmetric** with its LREM branch: the flag→list re-push re-validates `IsInDLQ`
 >    before pushing (closes a transient ack-race the final review found).
 > 5. **Request-id correlation**: the API layer propagates a `request_id` context logger; async worker tasks
@@ -85,7 +86,7 @@ The Python implementation leans heavily on frameworks (FastAPI, Celery, SQLAlche
 
 ## Architecture: Hexagonal (Ports & Adapters)
 
-**The dependency rule**: arrows always point inward. `domain` has zero imports outside stdlib. Adapters (`store`, `queue`, `cache`, `ratelimit`, `breaker`) depend on domain interfaces — never the reverse.
+**The dependency rule**: arrows always point inward. `domain` has zero imports outside stdlib. Shared capabilities live in `domain`; workflow-specific persistence seams are narrow and owned by their consumers. Infrastructure adapters never leak into API or worker code.
 
 ```
 ┌──────────────────────────────────────────────────────────────────────┐
@@ -105,8 +106,7 @@ The Python implementation leans heavily on frameworks (FastAPI, Celery, SQLAlche
           ┌─────────────────▼────────────────────┐
           │            internal/domain            │
           │  Subscription, DeliveryLog, enums     │
-          │  Repository interfaces (ports)        │
-          │  Service interfaces (ports)           │
+          │  Pagination values + delivery port    │
           │  Sentinel errors                      │
           │  ← ZERO external imports →            │
           └──────┬──────────────────┬─────────────┘
@@ -114,12 +114,13 @@ The Python implementation leans heavily on frameworks (FastAPI, Celery, SQLAlche
     ┌─────────────▼──┐    ┌──────────▼───────────────────────────────┐
     │ internal/store  │    │            internal/infra                │
     │ PostgreSQL/pgx  │    │  queue/     (Redis LIST + Sorted Set)    │
-    │ Repository impl │    │  cache/     (Redis read-through)         │
-    │ Raw SQL, txns   │    │  breaker/   (per-URL circuit breaker)    │
-    └─────────────────┘    │  ratelimit/ (per-sub token bucket)       │
-                           │  safedial/  (SSRF prevention dialer)     │
+    │ Repository impl │    │  breaker/   (per-URL circuit breaker)    │
+    │ Raw SQL, txns   │    │  ratelimit/ (per-sub token bucket)       │
+    └─────────────────┘    │  safedial/  (SSRF prevention dialer)     │
                            │  signature/ (HMAC sign/verify)           │
                            └──────────────────────────────────────────┘
+      internal/subscription                 internal/lifecycle
+    (Redis read-through + policy state)   (HTTP + process supervision)
 ```
 
 ---
@@ -139,7 +140,7 @@ webhook-delivery-system/                # module github.com/Vaibtan/webhook-deli
 │   ├── domain/                       # ← ZERO external imports in this directory
 │   │   ├── subscription.go           # Subscription type + validation (HTTPS-only check, ALLOW_HTTP_URLS override)
 │   │   ├── delivery.go               # DeliveryLog type, DeliveryStatus enum
-│   │   ├── ports.go                  # All repository + service interfaces
+│   │   ├── ports.go                  # Pagination values + delivery service port
 │   │   └── errors.go                 # Sentinel errors (ErrNotFound, ErrConflict…)
 │   │
 │   ├── api/
@@ -154,16 +155,14 @@ webhook-delivery-system/                # module github.com/Vaibtan/webhook-deli
 │   │
 │   ├── store/
 │   │   ├── db.go                     # pgxpool setup, embedded migrate runner
-│   │   ├── subscription_repo.go      # Implements domain.SubscriptionRepository (cursor-pagination, ORDER BY)
-│   │   └── delivery_log_repo.go      # Implements domain.DeliveryLogRepository
+│   │   ├── subscription_repo.go      # PostgreSQL subscription adapter (cursor-pagination, ORDER BY)
+│   │   └── delivery_log_repo.go      # PostgreSQL delivery-log adapter; consumers own narrow seams
 │   │
 │   ├── infra/
 │   │   ├── queue/
 │   │   │   └── redis_queue.go        # LPUSH/BRPOP for immediate delivery tasks
 │   │   ├── scheduler/
 │   │   │   └── redis_scheduler.go    # ZADD/Lua script ZRANGEBYSCORE+ZREM retry sorted set
-│   │   ├── cache/
-│   │   │   └── subscription_cache.go # Read-through Redis cache for subscriptions
 │   │   ├── breaker/
 │   │   │   └── circuit_breaker.go    # Per-URL CB: Closed→Open→Half-Open FSM with probing flag
 │   │   ├── ratelimit/
@@ -173,6 +172,10 @@ webhook-delivery-system/                # module github.com/Vaibtan/webhook-deli
 │   │   └── signature/
 │   │       └── hmac.go               # Sign, Verify, CanonicalJSON (json.Number safe)
 │   │
+│   ├── subscription/
+│   │   └── state.go                  # CRUD, cache coherence, delivery outcomes, rate/concurrency state
+│   ├── lifecycle/
+│   │   └── supervisor.go             # Coordinated cancellation, HTTP shutdown, worker drain
 │   └── worker/
 │       ├── pool.go                   # Goroutine pool, errgroup, graceful stop, BRPOP timeout
 │       ├── delivery.go               # HTTP delivery: re-check is_active → sign → check CB/RL/SSRF → send → drain
@@ -296,7 +299,7 @@ func (p *Pool) Start(ctx context.Context) error {
     return g.Wait()                      // drains all in-flight within the deadline
 }
 ```
-*(`errgroup` still earns its keep at the top level in `cmd/server/main.go`, where the supervisor `g.Wait()`s over the pool, scheduler, recovery, cleanup, and dlq-reconciler goroutines and propagates the first fatal startup error.)*
+*(`errgroup` also powers `internal/lifecycle`, where the supervisor coordinates the HTTP server, pool, scheduler, recovery, cleanup, and DLQ reconciler and propagates the first fatal error.)*
 
 ---
 
@@ -639,9 +642,8 @@ When processing responses, we truncate error response bodies to `512` characters
 
 ### 9. Dev Mode Sync Delivery Option
 
-In development, developers can skip Redis and run deliveries synchronously within the ingest handler request lifecycle.
-This is controlled via the `SYNC_DELIVERY` environment variable:
-- `SYNC_DELIVERY=true`: Deliver the payload synchronously (blocks ingest HTTP call).
+In development, the first delivery can run synchronously within the ingest handler request lifecycle. Redis remains required because retries, recovery, maintenance, and subscription caching stay active in both modes. This is controlled via the `SYNC_DELIVERY` environment variable:
+- `SYNC_DELIVERY=true`: Make the first delivery attempt synchronously (blocks the ingest HTTP call); any persisted successors are retried by the always-on background pipeline.
 - `SYNC_DELIVERY=false` (default): Enqueue task to Redis and return `202 Accepted` immediately.
 
 ---
@@ -676,7 +678,7 @@ All config is parsed from env into a typed `Config` struct (stdlib `os.Getenv` +
 | `SECRET_GRACE_WINDOW` | `24h` | Previous-secret acceptance window after rotation (§5) |
 | `DRAIN_TIMEOUT` | `30s` | Graceful-shutdown in-flight drain deadline (§1) |
 | `ALLOW_HTTP_URLS` | `false` | Permit non-HTTPS target URLs (local dev) |
-| `SYNC_DELIVERY` | `false` | Deliver synchronously in the ingest request instead of enqueuing (§9) |
+| `SYNC_DELIVERY` | `false` | Make the first attempt synchronously instead of enqueuing it; retries remain asynchronous (§9) |
 | `ENABLE_PPROF` | `false` | Mount `/api/v1/debug/pprof/` |
 | `CORS_ALLOWED_ORIGINS` | — | Explicit origin allow-list (never `*` combined with credentials) |
 | `ADMIN_API_KEY` | — (required for admin routes) | Bearer token for management/operational endpoints; if unset the admin group fails closed (Authentication & Authorization) |
@@ -895,8 +897,8 @@ To prevent Out of Memory (OOM) and DoS attacks:
 - We wrap incoming HTTP request bodies in a global size limiter.
 - Webhook payloads to `/api/v1/ingest/{id}` are strictly capped at 64KB using `http.MaxBytesReader`. Payloads exceeding 64KB return `413 Payload Too Large`.
 
-### 5. Cache Coherency (Read-Through Invalidation)
-The subscription cache (`subscription:{uuid}`, TTL 5min) is read-through on ingest/delivery and **must be evicted on every write path**, or a worker could sign outbound deliveries with a stale secret or keep delivering to a deactivated subscription for up to the TTL. The Python service evicts on update/delete (`app/services/subscription_service.py`); the Go service additionally evicts on the new write paths:
+### 5. Subscription State and Cache Coherency
+`internal/subscription.State` is the mutation boundary for durable subscription changes, delivery-outcome counter changes, Redis coherence, and derived rate/concurrency state. The `subscription:{uuid}` cache (TTL 5min) is read-through on ingest/delivery and **must be evicted on every state-changing write path**, or a worker could sign with a stale secret or keep delivering to a deactivated subscription. Reads and writes for the same subscription are serialized with bounded lock striping, preventing an in-flight miss from back-filling stale state after a committed write. A failed Redis invalidation records a local dirty marker so reads bypass the stale key until repair or TTL expiry.
 
 | Write path | Cache action |
 |---|---|
@@ -957,7 +959,7 @@ The following patterns were evaluated during design and are documented here for 
 - `internal/infra/safedial` — SSRF DialContext and resolver
 - `internal/infra/queue` — Redis LIST queue + DLQ
 - `internal/infra/scheduler` — Redis ZSET retry scheduler (Lua script claims)
-- `internal/infra/cache` — subscription read-through cache
+- `internal/subscription` — subscription read-through cache and derived runtime state
 - `internal/worker/pool` + `internal/worker/delivery` — end-to-end delivery with response body drain
 - `internal/worker/retry` (RetrySchedulerWorker) — scheduler goroutine with Lua script polling
 - `internal/worker/retry` (RecoveryWorker) — orphaned task recovery goroutine

@@ -1,7 +1,7 @@
 // Package registry is a generic, bounded, concurrency-safe map of per-key
 // resources (token buckets keyed by subscription, semaphores by subscription,
 // circuit breakers by target URL). All three share one eviction discipline:
-// a periodic idle sweep plus explicit removal on subscription delete (plan Adv §3).
+// a periodic idle sweep plus explicit removal on subscription policy changes.
 package registry
 
 import (
@@ -59,9 +59,6 @@ func (r *Registry[T]) Remove(key string) {
 func (r *Registry[T]) Sweep() int {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if r.idleTTL <= 0 {
-		return 0
-	}
 	cutoff := r.now().Add(-r.idleTTL)
 	n := 0
 	for k, s := range r.items {
@@ -71,13 +68,6 @@ func (r *Registry[T]) Sweep() int {
 		}
 	}
 	return n
-}
-
-// Len reports the current number of live entries.
-func (r *Registry[T]) Len() int {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	return len(r.items)
 }
 
 // Snapshot returns a copy of the current key→value map (e.g. to report circuit

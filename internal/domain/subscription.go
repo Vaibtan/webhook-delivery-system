@@ -5,15 +5,20 @@ import (
 	"net/url"
 	"strings"
 	"time"
+	"unicode/utf8"
 )
 
-// Subscription is a webhook endpoint registration. It mirrors the Python
-// `Subscription` model plus the NEW fields introduced by the Go port:
-// is_active, consecutive_failures, and the dual-secret rotation columns.
-//
-// IDs are plain strings (UUID text) so this package keeps ZERO non-stdlib
-// imports — the dependency rule (arrows point inward). The store adapter is
-// responsible for UUID generation and any driver-specific encoding.
+const (
+	// MaxTargetURLLength mirrors subscriptions.target_url and
+	// delivery_logs.target_url (VARCHAR(2048)). Validate at the HTTP boundary so
+	// oversized input is a client error rather than a database error.
+	MaxTargetURLLength = 2048
+	// MaxEventTypeLength mirrors delivery_logs.event_type (VARCHAR(100)).
+	MaxEventTypeLength = 100
+)
+
+// Subscription is a webhook endpoint registration. IDs remain UUID text so the
+// domain package does not depend on a database driver.
 type Subscription struct {
 	ID                  string
 	TargetURL           string
@@ -33,6 +38,9 @@ type Subscription struct {
 func ValidateTargetURL(raw string, allowHTTP bool) error {
 	if strings.TrimSpace(raw) == "" {
 		return fmt.Errorf("%w: target_url is required", ErrInvalidInput)
+	}
+	if !utf8.ValidString(raw) || utf8.RuneCountInString(raw) > MaxTargetURLLength {
+		return fmt.Errorf("%w: target_url must be at most %d characters", ErrInvalidInput, MaxTargetURLLength)
 	}
 	u, err := url.Parse(raw)
 	if err != nil {
@@ -54,9 +62,17 @@ func ValidateTargetURL(raw string, allowHTTP bool) error {
 	}
 }
 
+// ValidateEventType enforces the storage contract for an optional ingest event
+// type. The empty value is valid and means that no type was supplied.
+func ValidateEventType(eventType string) error {
+	if !utf8.ValidString(eventType) || utf8.RuneCountInString(eventType) > MaxEventTypeLength {
+		return fmt.Errorf("%w: event_type must be at most %d characters", ErrInvalidInput, MaxEventTypeLength)
+	}
+	return nil
+}
+
 // AcceptsEvent reports whether this subscription should receive an event of the
-// given type. An empty EventTypes list means "all events" (parity with the
-// Python exact-match filter, which treats no filter as accept-all).
+// given type. An empty EventTypes list accepts every event.
 func (s *Subscription) AcceptsEvent(eventType string) bool {
 	if len(s.EventTypes) == 0 {
 		return true

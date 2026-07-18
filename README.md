@@ -28,32 +28,36 @@ A production-grade webhook delivery service written in **Go 1.26** — a portfol
 
 ## Architecture (ADR)
 
-The service is built as a **hexagonal (ports & adapters)** application. The dependency rule is strict and one-directional: **`internal/domain` imports nothing outside the standard library**, and every adapter depends on domain ports — never the reverse.
+The service uses a **ports-and-adapters** core with consumer-owned seams. **`internal/domain` imports nothing outside the standard library**; API, workers, lifecycle, and subscription state declare the capabilities they consume, and concrete adapters satisfy them implicitly.
 
 ```
                         cmd/server/main.go
-        parse config -> init adapters -> wire services -> run goroutines
+        parse config -> init adapters -> wire services -> lifecycle.Run
                  |                                  |
         internal/api  (net/http ServeMux)   internal/worker  (pool, scheduler,
         handlers, middleware                  recovery, cleanup, dlq-reconciler)
                  \                                  /
+        internal/subscription (cache + policy state)  internal/lifecycle
+                         \                 /
                        internal/domain
-            Subscription, DeliveryLog, enums, ports,
+            Subscription, DeliveryLog, values, port,
                  sentinel errors  (ZERO external imports)
                  /                                  \
         internal/store  (PostgreSQL/pgx)    internal/infra/*  (queue, scheduler,
-        repository impls, raw SQL, txns       cache, breaker, ratelimit,
-                                              safedial, signature, metrics)
+        repository impls, raw SQL, txns       breaker, ratelimit, safedial,
+                                              signature, metrics)
 ```
 
 | Layer | Responsibility |
 |---|---|
-| `cmd/server` | Composition root: parse config, run embedded migrations, wire adapters via DI, supervise goroutines with `errgroup`. |
+| `cmd/server` | Composition root: parse config, run embedded migrations, and wire adapters via DI. |
 | `internal/config` | Typed `Config` struct, stdlib `os.Getenv` parsing — no config framework. |
-| `internal/domain` | Entities (`Subscription`, `DeliveryLog`), enums, repository/service **ports**, sentinel errors. Pure stdlib. |
+| `internal/domain` | Entities (`Subscription`, `DeliveryLog`), enums, value types, delivery service port, sentinel errors. Pure stdlib. |
 | `internal/api` | `net/http` `ServeMux` (Go 1.22+ `{id}` path params), middleware chain, handlers. |
 | `internal/store` | `pgx/v5` pool + raw-SQL repository implementations (cursor pagination, transactions). |
-| `internal/infra/*` | Redis queue/scheduler/cache, circuit breaker, token-bucket rate limiter, SSRF dialer, HMAC signer, latency metrics. |
+| `internal/subscription` | Deep subscription-state boundary: durable mutations, Redis read-through coherence, delivery outcomes, rate limits, and concurrency controls. |
+| `internal/lifecycle` | Supervises HTTP and background processes, coordinated cancellation, bounded shutdown, and worker draining. |
+| `internal/infra/*` | Redis queue/scheduler, circuit breaker, token-bucket rate limiter, SSRF dialer, HMAC signer, latency metrics. |
 | `internal/worker` | Bounded worker pool, retry scheduler, orphan recovery, retention cleanup, DLQ reconciler — all goroutine-based. |
 
 ### Key design decisions (and why)
@@ -62,7 +66,9 @@ The service is built as a **hexagonal (ports & adapters)** application. The depe
 - **CAS + single-transaction + visibility-lease lifecycle.** Every status transition is a compare-and-swap (`UPDATE … WHERE id=$1 AND status='pending'`); a 0-row result means another worker already finalized it, so the loser aborts with no side effects. The `failed_attempt` update and its successor `INSERT` share **one transaction**, so a crash can never strand a `failed_attempt` row without a `pending` successor. When a worker claims a row it stamps a `VISIBILITY_TIMEOUT` lease (`next_retry_at = now()+lease WHERE … AND next_retry_at <= now()`), which is itself the mutual-exclusion point for duplicate dequeues. **Postgres is the source of truth; Redis is a derived index** healed by the recovery job and the DLQ reconciler. (Plan §0, §1.)
 - **Redis sorted-set retry scheduler with an atomic Lua claim.** Due retries are moved from `webhook:retry:schedule` (ZSET, `score = next_retry_at`) into `webhook:queue` by a single Lua script (`ZRANGEBYSCORE` + `ZREM` + `LPUSH`), eliminating the race where two schedulers claim the same retry. (Plan §2.)
 - **Per-URL circuit breaker with a generation-token authoritative probe.** A Closed→Open→Half-Open FSM built on `sync/atomic`. `Allow()` returns a generation token; only a result still carrying the current generation can change state, so a late-finishing request can't spuriously close the breaker. A breaker denial reschedules the `pending` row **without consuming a retry attempt**, so a down target never burns a healthy payload's 5-attempt budget. (Plan §3.)
-- **Per-subscription token-bucket rate limiter + non-blocking concurrency semaphore.** A mutex-only, fixed-point token bucket per subscription enforces ingest rate. A per-subscription semaphore (acquired **non-blockingly**) caps in-flight deliveries; if a subscription is at its limit the worker reschedules with a short backoff (no attempt consumed) rather than parking, preventing head-of-line blocking. (Plan §4, Adv §3.)
+- **Per-subscription token-bucket rate limiter + non-blocking concurrency semaphore.** A mutex-only, fixed-point token bucket per subscription enforces ingest rate **after HMAC authentication**, so knowing a subscription UUID is insufficient to exhaust its quota. A per-subscription semaphore (acquired **non-blockingly**) caps in-flight deliveries; if a subscription is at its limit the worker reschedules with a short backoff (no attempt consumed) rather than parking, preventing head-of-line blocking. (Plan §4, Adv §3.)
+- **Race-safe subscription cache.** Read-through and mutation paths for the same subscription are lock-striped, so an in-flight miss cannot restore a stale secret, URL, or active flag after a committed write. If Redis invalidation fails, an in-process dirty marker bypasses the stale entry until repair or TTL expiry.
+- **Bounded inbound HTTP connections.** The API combines 1 MiB global / 64 KiB ingest body caps with header, full-request-read, response-write, idle, and maximum-header limits, so a slow client cannot hold a connection indefinitely by trickling a body.
 - **SSRF-safe dialer.** The outbound `http.Transport` dials through a custom `SafeDialContext` built on `net/netip` that resolves the host and rejects loopback/private/link-local/CGNAT/reserved ranges (with `Unmap()` to defeat the `::ffff:` IPv4-mapped bypass), pins the vetted IP to defeat DNS rebinding, sets `Proxy: nil` so a proxy env var can't tunnel around the check, and enforces a redirect cap + HTTPS-downgrade rejection. (Plan §6.)
 - **Postgres-authoritative idempotency (NOT Redis `SETNX`).** The optional `X-Idempotency-Key` is deduped via an `INSERT … ON CONFLICT DO NOTHING` into `ingest_idempotency` **in the same transaction** as the initial `pending` delivery row. A Redis-only `SETNX` would commit the dedupe marker before the DB write and could acknowledge a key whose webhook never durably landed — the atomic Postgres path makes that failure mode impossible. (Plan §5.)
 
@@ -202,7 +208,7 @@ All configuration is parsed from the environment into a typed `Config` struct (s
 | `RETRY_BASE_DELAY` | `10s` | Base of the ×3 backoff curve. |
 | `RETRY_MAX_DELAY` | `15m` | Backoff cap guard. |
 | `VISIBILITY_TIMEOUT` | `60s` | Lease stamped on a claimed `pending` row; bounds recovery latency & duplicate risk. |
-| `ORPHAN_THRESHOLD` | `15m` | Coarse backstop for a `pending` row with no live lease. |
+| `ORPHAN_THRESHOLD` | `15m` | Age before a lease-less (`next_retry_at IS NULL`) pending row is atomically rearmed and recovered. |
 | `RECOVERY_SCAN_INTERVAL` | `5m` | Period of the orphan-recovery scan. |
 | `LOG_RETENTION_HOURS` | `72` | Cleanup horizon for non-DLQ rows. |
 | `DLQ_MAX_AGE` | `720h` (30d) | Force-ack age for un-acked DLQ entries. |
@@ -217,10 +223,12 @@ All configuration is parsed from the environment into a typed `Config` struct (s
 | `SIGNATURE_DRIFT_WINDOW` | `5m` | Allowed `Webhook-Timestamp` clock skew (replay window bound). |
 | `SECRET_GRACE_WINDOW` | `24h` | Previous-secret acceptance window after rotation. |
 | `ALLOW_HTTP_URLS` | `false` | Permit non-HTTPS target URLs (local dev). |
-| `SYNC_DELIVERY` | `false` | Deliver synchronously in the ingest request instead of enqueuing. |
+| `SYNC_DELIVERY` | `false` | Make the first attempt synchronously; retries and maintenance still use the always-on background pipeline. |
 | `ENABLE_PPROF` | `false` | Mount `/api/v1/debug/pprof/`. |
 | `CORS_ALLOWED_ORIGINS` | — | Explicit origin allow-list (never `*` combined with credentials). |
 | `ADMIN_API_KEY` | — (required for admin routes) | Bearer token for management/operational endpoints; the admin group fails closed (`503`) if unset. |
+
+Startup rejects unsafe zero/negative values and contradictory relationships—for example, `VISIBILITY_TIMEOUT <= WEBHOOK_TIMEOUT`, `DRAIN_TIMEOUT < WEBHOOK_TIMEOUT`, `RETRY_MAX_DELAY < RETRY_BASE_DELAY`, or `IDEMPOTENCY_TTL < SIGNATURE_DRIFT_WINDOW`.
 
 ---
 
@@ -234,7 +242,7 @@ All endpoints are versioned under `/api/v1`. Paths below match `internal/api/ser
 | `GET` | `/api/v1/ready` | Public | Readiness probe (worker pool running?). |
 | `GET` | `/api/v1/openapi.json` | Public | OpenAPI 3.1 spec (embedded via `//go:embed`). |
 | `GET` | `/api/v1/docs` | Public | **Interactive Swagger UI** (loads swagger-ui from CDN against `/openapi.json`). |
-| `POST` | `/api/v1/ingest/{id}` | HMAC | Ingest a payload for subscription `{id}`. Requires `X-Hub-Signature-256` + `Webhook-Timestamp`; checks `is_active` + rate limit; event-type filter; body capped at 64 KB. |
+| `POST` | `/api/v1/ingest/{id}` | HMAC | Ingest one valid JSON payload for subscription `{id}`. Requires `X-Hub-Signature-256` + `Webhook-Timestamp`; checks `is_active`, then charges the authenticated rate limit; event-type filter; body capped at 64 KB. |
 | `POST` | `/api/v1/subscriptions` | Admin | Create a subscription (HTTPS target required unless `ALLOW_HTTP_URLS=true`). |
 | `GET` | `/api/v1/subscriptions` | Admin | List subscriptions — keyset/cursor pagination (`?limit`, `?cursor`), returns `{items, next_cursor}`. |
 | `GET` | `/api/v1/subscriptions/{id}` | Admin | Get a subscription. |
@@ -408,13 +416,16 @@ go test -tags=integration ./...     # integration tests (require docker infra up
 make lint                           # golangci-lint, clean
 ```
 
-- **Unit tests** cover signature sign/verify, the SSRF `safedial` classifier, the circuit-breaker FSM (including stale-generation rejection), the token-bucket rate limiter, the in-memory registries, the latency metrics histogram, and the worker pool teardown semantics.
+- **Unit tests** cover signature sign/verify, request/cursor validation, configuration invariants, authenticated rate-limit ordering, HTTP server timeouts, the SSRF `safedial` classifier, the circuit-breaker FSM (including stale-generation rejection), the token-bucket rate limiter, recovery pagination, intentional non-DLQ drops, the in-memory registries, the latency metrics histogram, and worker-pool teardown semantics.
 - **Integration tests** (behind the `integration` build tag) exercise the high-risk failure modes against real Postgres + Redis:
   - cleanup never deletes `pending` rows,
   - concurrent same-key ingest collapses to one row,
   - single-claim dequeue (no double-delivery under duplicate queue entries),
   - concurrent replay produces exactly one new chain,
-  - recovery reclaims orphaned `pending` rows.
+  - recovery drains more than one batch and atomically rearms threshold-old lease-less rows,
+  - a read-through cache miss racing an update cannot restore stale subscription state,
+  - an in-request first failure is retried by the background pipeline,
+  - intentional inactive-subscription drops remain outside the DLQ.
 - The codebase is **golangci-lint clean**.
 - **Continuous integration** ([`.github/workflows`](.github/workflows)): every push and pull request runs lint (`go vet` + `gofmt` + golangci-lint), the unit suite under the race detector (`go test -race -shuffle=on`), and the full integration suite against ephemeral Postgres + Redis service containers (migrated first). Dependabot tracks module, Actions and Docker updates. The race detector runs on the Linux runners (CGO available) where it cannot on the Windows dev box.
 

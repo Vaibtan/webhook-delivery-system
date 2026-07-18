@@ -1,12 +1,8 @@
-// Command server is the single binary for the webhook delivery system. It runs
-// the HTTP API, the background workers (added in later slices), and — gated by
-// the -migrate flag — the database migration tooling. Bundling migrate into the
-// same binary keeps the distroless deploy image dependency-free.
+// Command server runs the HTTP API, delivery workers, and migration tooling.
 package main
 
 import (
 	"context"
-	"errors"
 	"flag"
 	"fmt"
 	"log/slog"
@@ -16,20 +12,17 @@ import (
 	"syscall"
 	"time"
 
-	"golang.org/x/sync/errgroup"
-
 	"github.com/Vaibtan/webhook-delivery-system/internal/api"
 	"github.com/Vaibtan/webhook-delivery-system/internal/config"
 	"github.com/Vaibtan/webhook-delivery-system/internal/infra/breaker"
-	"github.com/Vaibtan/webhook-delivery-system/internal/infra/cache"
 	"github.com/Vaibtan/webhook-delivery-system/internal/infra/metrics"
 	"github.com/Vaibtan/webhook-delivery-system/internal/infra/queue"
-	"github.com/Vaibtan/webhook-delivery-system/internal/infra/ratelimit"
 	"github.com/Vaibtan/webhook-delivery-system/internal/infra/registry"
 	"github.com/Vaibtan/webhook-delivery-system/internal/infra/safedial"
 	"github.com/Vaibtan/webhook-delivery-system/internal/infra/scheduler"
-	"github.com/Vaibtan/webhook-delivery-system/internal/infra/semaphore"
+	"github.com/Vaibtan/webhook-delivery-system/internal/lifecycle"
 	"github.com/Vaibtan/webhook-delivery-system/internal/store"
+	"github.com/Vaibtan/webhook-delivery-system/internal/subscription"
 	"github.com/Vaibtan/webhook-delivery-system/internal/worker"
 )
 
@@ -105,33 +98,17 @@ func run(migrateMode string) error {
 	retrySched := scheduler.New(rdb)
 	dlq := queue.NewDLQ(rdb)
 
-	// Bounded in-memory registries (idle-TTL swept + evicted on subscription
-	// delete): per-sub rate buckets, per-sub concurrency semaphores, per-URL
-	// circuit breakers (plan Adv §3).
-	bucketReg := registry.New(func(string) *ratelimit.TokenBucket {
-		return ratelimit.NewTokenBucket(cfg.RateLimitPerSec, cfg.RateLimitBurst)
-	}, cfg.RegistryIdleTTL)
-	semReg := registry.New(func(string) *semaphore.Semaphore {
-		return semaphore.New(cfg.PerSubConcurrency)
-	}, cfg.RegistryIdleTTL)
 	breakerReg := registry.New(func(string) *breaker.CircuitBreaker {
 		return breaker.New(cfg.BreakerThreshold, cfg.BreakerResetTimeout)
 	}, cfg.RegistryIdleTTL)
 
-	// Read-through subscription cache; ingest + delivery read subs through it.
-	subCache := cache.NewSubscriptionCache(rdb, subscriptionRepo, cfg.CacheTTL)
-
-	// Unified eviction (delete-on-write): cache + per-sub registries. Called from
-	// every subscription write path (update/delete/rotate, and auto-disable).
-	evictSubscription := func(subID string) {
-		ectx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-		defer cancel()
-		if err := subCache.Evict(ectx, subID); err != nil {
-			slog.Warn("evict subscription cache failed", "subscription_id", subID, "error", err)
-		}
-		bucketReg.Remove(subID)
-		semReg.Remove(subID)
-	}
+	subscriptionState := subscription.New(rdb, subscriptionRepo, deliveryLogRepo, subscription.Config{
+		CacheTTL:         cfg.CacheTTL,
+		RegistryIdleTTL:  cfg.RegistryIdleTTL,
+		RateLimitPerSec:  cfg.RateLimitPerSec,
+		RateLimitBurst:   cfg.RateLimitBurst,
+		ConcurrencyLimit: cfg.PerSubConcurrency,
+	})
 
 	// Observability: delivery metrics collector (latency histogram + expvar
 	// counters). Published to expvar once, here at the composition root.
@@ -141,46 +118,31 @@ func run(migrateMode string) error {
 	// Hardened, SSRF-safe HTTP client for all outbound deliveries.
 	httpClient := safedial.NewHardenedClient(cfg.WebhookTimeout, cfg.AllowHTTPURLs)
 
-	// The breaker + per-sub concurrency gates are wired only in async mode (their
-	// requeues are processed by the pool/scheduler). Construction is one shot —
-	// absent options default to no-ops inside the deliverer.
-	delivererOpts := []worker.Option{
-		worker.WithEvictHook(evictSubscription),
-		worker.WithMetrics(collector),
-	}
-	if !cfg.SyncDelivery {
-		delivererOpts = append(delivererOpts,
-			worker.WithBreakerRegistry(func(url string) worker.Breaker { return breakerReg.Get(url) }),
-			worker.WithConcurrencyRegistry(func(subID string) worker.Sem { return semReg.Get(subID) }),
-		)
-	}
-	deliverer := worker.NewDeliverer(deliveryLogRepo, subCache, retrySched, dlq, httpClient, worker.DelivererConfig{
+	// The background scheduler/pool runs in both modes, so retry, breaker, and
+	// concurrency reschedules are always durable. SYNC_DELIVERY controls only the
+	// first attempt made by the ingest request.
+	deliverer := worker.NewDeliverer(deliveryLogRepo, subscriptionState, retrySched, dlq, httpClient, worker.DelivererConfig{
 		VisibilityTimeout:    cfg.VisibilityTimeout,
 		MaxRetryAttempts:     cfg.MaxRetryAttempts,
 		RetryBaseDelay:       cfg.RetryBaseDelay,
 		RetryMaxDelay:        cfg.RetryMaxDelay,
 		BreakerResetTimeout:  cfg.BreakerResetTimeout,
 		AutoDisableThreshold: cfg.AutoDisableThreshold,
-	}, delivererOpts...)
+	}, worker.DeliveryControls{
+		BreakerFor:   func(url string) worker.Breaker { return breakerReg.Get(url) },
+		SemaphoreFor: func(subID string) worker.Sem { return subscriptionState.Semaphore(subID) },
+		Metrics:      collector,
+	})
 
-	// In async mode (the default) the background pipeline runs: a bounded worker
-	// pool drains the queue, the retry poller re-enqueues due retries, the
-	// recovery scanner reclaims orphaned pending rows, the cleanup worker reaps
-	// expired rows, and the DLQ reconciler heals the LIST↔flag index.
-	var (
-		pool          *worker.Pool
-		retryPoller   *worker.RetrySchedulerWorker
-		recoveryScan  *worker.RecoveryWorker
-		cleanupWorker *worker.CleanupWorker
-		dlqReconciler *worker.DLQReconciler
+	// The background pipeline always runs. In sync mode it handles successors
+	// created by an in-request first attempt, as well as recovery and maintenance.
+	pool := worker.NewPool(taskQueue, deliverer, cfg.WorkerConcurrency, cfg.DrainTimeout)
+	retryPoller := worker.NewRetrySchedulerWorker(retrySched, time.Second)
+	recoveryScan := worker.NewRecoveryWorker(
+		deliveryLogRepo, taskQueue, cfg.RecoveryScanInterval, 100, cfg.OrphanThreshold,
 	)
-	if !cfg.SyncDelivery {
-		pool = worker.NewPool(taskQueue, deliverer, cfg.WorkerConcurrency, cfg.DrainTimeout)
-		retryPoller = worker.NewRetrySchedulerWorker(retrySched, time.Second)
-		recoveryScan = worker.NewRecoveryWorker(deliveryLogRepo, taskQueue, cfg.RecoveryScanInterval, 100)
-		cleanupWorker = worker.NewCleanupWorker(deliveryLogRepo, cfg.LogRetention, cfg.IdempotencyTTL, time.Hour)
-		dlqReconciler = worker.NewDLQReconciler(deliveryLogRepo, dlq, cfg.DLQMaxAge, cfg.RecoveryScanInterval)
-	}
+	cleanupWorker := worker.NewCleanupWorker(deliveryLogRepo, cfg.LogRetention, cfg.IdempotencyTTL, time.Hour)
+	dlqReconciler := worker.NewDLQReconciler(deliveryLogRepo, dlq, cfg.DLQMaxAge, cfg.RecoveryScanInterval)
 
 	if cfg.AdminAPIKey == "" {
 		slog.Warn("ADMIN_API_KEY is unset; management endpoints will fail closed (503)")
@@ -189,18 +151,19 @@ func run(migrateMode string) error {
 	srv := api.NewServer(api.Options{
 		PingDB:      dbPool.Ping,
 		PingRedis:   func(ctx context.Context) error { return rdb.Ping(ctx).Err() },
-		WorkerReady: workerReady(pool),
+		WorkerReady: pool.Running,
 
-		Subscriptions: subCache,
-		DeliveryLogs:  deliveryLogRepo,
+		Subscriptions:  subscriptionState,
+		DeliveryIngest: deliveryLogRepo,
+		DeliveryStatus: deliveryLogRepo,
+		DeliveryDLQ:    deliveryLogRepo,
 
 		SyncDelivery: cfg.SyncDelivery,
 		Deliverer:    deliverer,
 		TaskQueue:    taskQueue,
 		DLQ:          dlq,
 
-		RateLimitAllow:    func(subID string) bool { return bucketReg.Get(subID).Allow() },
-		EvictSubscription: evictSubscription,
+		RateLimitAllow: subscriptionState.Allow,
 
 		Metrics: collector,
 		BreakerStates: func() map[string]string {
@@ -219,70 +182,50 @@ func run(migrateMode string) error {
 		SecretGraceWindow:    cfg.SecretGraceWindow,
 	})
 
-	httpServer := &http.Server{
-		Addr:              cfg.Addr(),
-		Handler:           srv.Handler(),
-		ReadHeaderTimeout: 10 * time.Second,
-	}
+	httpServer := newHTTPServer(cfg.Addr(), srv.Handler())
+	supervisor := lifecycle.New(
+		httpServer,
+		cfg.DrainTimeout,
+		lifecycle.Process{Name: "worker pool", Run: pool.Start},
+		lifecycle.Process{Name: "retry scheduler", Run: retryPoller.Run},
+		lifecycle.Process{Name: "recovery scanner", Run: recoveryScan.Run},
+		lifecycle.Process{Name: "cleanup worker", Run: cleanupWorker.Run},
+		lifecycle.Process{Name: "dlq reconciler", Run: dlqReconciler.Run},
+		lifecycle.Process{
+			Name: "registry sweeper",
+			Run: func(ctx context.Context) error {
+				return runSweep(ctx, sweepInterval(cfg.RegistryIdleTTL), subscriptionState, breakerReg)
+			},
+		},
+	)
 
-	// Supervisor: HTTP server + graceful shutdown + worker pool. gctx is cancelled
-	// on SIGTERM (parent ctx) or the first fatal error.
-	g, gctx := errgroup.WithContext(ctx)
-
-	g.Go(func() error {
-		slog.Info("http server listening", "addr", cfg.Addr())
-		if err := httpServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			return err
-		}
-		return nil
-	})
-	g.Go(func() error {
-		<-gctx.Done()
-		slog.Info("shutdown signal received; draining")
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), cfg.DrainTimeout)
-		defer cancel()
-		return httpServer.Shutdown(shutdownCtx)
-	})
-	if pool != nil {
-		g.Go(func() error {
-			slog.Info("worker pool starting", "concurrency", cfg.WorkerConcurrency)
-			return pool.Start(gctx) // stops dequeuing on gctx cancel, then drains in-flight
-		})
-		g.Go(func() error {
-			slog.Info("retry scheduler starting")
-			return retryPoller.Run(gctx)
-		})
-		g.Go(func() error {
-			slog.Info("recovery scanner starting", "interval", cfg.RecoveryScanInterval)
-			return recoveryScan.Run(gctx)
-		})
-		g.Go(func() error {
-			slog.Info("cleanup worker starting", "retention", cfg.LogRetention)
-			return cleanupWorker.Run(gctx)
-		})
-		g.Go(func() error {
-			slog.Info("dlq reconciler starting")
-			return dlqReconciler.Run(gctx)
-		})
-	}
-
-	// Idle-eviction sweep for the in-memory registries (runs in both modes).
-	g.Go(func() error {
-		return runSweep(gctx, sweepInterval(cfg.RegistryIdleTTL), bucketReg, semReg, breakerReg)
-	})
-
-	if err := g.Wait(); err != nil {
-		return fmt.Errorf("supervisor: %w", err)
+	slog.Info("http server listening", "addr", cfg.Addr())
+	if err := supervisor.Run(ctx); err != nil {
+		return err
 	}
 	slog.Info("shutdown complete")
 	return nil
+}
+
+// newHTTPServer centralizes inbound resource limits. MaxBytesReader bounds body
+// size in the handler; these deadlines additionally bound how long a client may
+// occupy a connection while slowly sending headers/body or receiving a response.
+func newHTTPServer(addr string, handler http.Handler) *http.Server {
+	return &http.Server{
+		Addr:              addr,
+		Handler:           handler,
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       15 * time.Second,
+		WriteTimeout:      60 * time.Second,
+		IdleTimeout:       60 * time.Second,
+		MaxHeaderBytes:    1 << 20,
+	}
 }
 
 // sweeper is the subset of registry.Registry the sweep loop needs (the concrete
 // generic types all satisfy it regardless of their element type).
 type sweeper interface {
 	Sweep() int
-	Len() int
 }
 
 func sweepInterval(idleTTL time.Duration) time.Duration {
@@ -308,13 +251,4 @@ func runSweep(ctx context.Context, interval time.Duration, sweepers ...sweeper) 
 			}
 		}
 	}
-}
-
-// workerReady backs the worker-aware /ready probe. In sync mode (no pool) it
-// returns nil so readiness falls back to dependency reachability.
-func workerReady(pool *worker.Pool) func() bool {
-	if pool == nil {
-		return nil
-	}
-	return pool.Running
 }

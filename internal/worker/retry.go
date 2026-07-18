@@ -3,24 +3,21 @@ package worker
 import (
 	"context"
 	"log/slog"
-	"math"
 	"math/rand/v2"
 	"time"
 
 	"github.com/Vaibtan/webhook-delivery-system/internal/domain"
 )
 
-// retryDelay returns the delay before the next attempt, given the attempt number
-// that JUST failed (1..). Geometric ×3 from base, capped at max, with ±20%
-// jitter so a thundering herd of simultaneous failures spreads out (plan §4b).
-// math/rand/v2 top-level funcs are safe for concurrent use.
+// retryDelay applies capped ×3 backoff with ±20% jitter.
 func retryDelay(attempt int, base, max time.Duration) time.Duration {
-	if base <= 0 {
-		base = 10 * time.Second
-	}
-	delay := time.Duration(float64(base) * math.Pow(3, float64(attempt-1)))
-	if max > 0 && delay > max {
-		delay = max
+	delay := base
+	for i := 1; i < attempt && delay < max; i++ {
+		if delay > max/3 {
+			delay = max
+			break
+		}
+		delay *= 3
 	}
 	jitter := delay / 5
 	if jitter <= 0 {
@@ -32,103 +29,117 @@ func retryDelay(attempt int, base, max time.Duration) time.Duration {
 // RetrySchedulerWorker polls the retry sorted set on an interval and atomically
 // moves due entries into the work queue via the scheduler's Lua script.
 type RetrySchedulerWorker struct {
-	sched    domain.RetryScheduler
+	sched    retryClaimer
 	interval time.Duration
 	now      func() time.Time
 }
 
+type retryClaimer interface {
+	ClaimDue(ctx context.Context, now time.Time) (int, error)
+}
+
 // NewRetrySchedulerWorker constructs the poller. A poll interval of ~1s keeps
 // retry latency tight without hammering Redis.
-func NewRetrySchedulerWorker(sched domain.RetryScheduler, interval time.Duration) *RetrySchedulerWorker {
-	if interval <= 0 {
-		interval = time.Second
-	}
+func NewRetrySchedulerWorker(sched retryClaimer, interval time.Duration) *RetrySchedulerWorker {
 	return &RetrySchedulerWorker{sched: sched, interval: interval, now: time.Now}
 }
 
 // Run polls until ctx is cancelled.
 func (w *RetrySchedulerWorker) Run(ctx context.Context) error {
-	ticker := time.NewTicker(w.interval)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return nil
-		case <-ticker.C:
-			n, err := w.sched.ClaimDue(ctx, w.now())
-			if err != nil {
-				if ctx.Err() != nil {
-					return nil
-				}
+	return runPeriodic(ctx, w.interval, false, func(ctx context.Context) {
+		n, err := w.sched.ClaimDue(ctx, w.now())
+		if err != nil {
+			if ctx.Err() == nil {
 				slog.Error("retry scheduler: claim due failed", "error", err)
-				continue
 			}
-			if n > 0 {
-				slog.Debug("retry scheduler: re-enqueued due retries", "count", n)
-			}
+			return
 		}
-	}
+		if n > 0 {
+			slog.Debug("retry scheduler: re-enqueued due retries", "count", n)
+		}
+	})
 }
 
 // dueFinder is the recovery worker's view of the delivery-log repository.
 type dueFinder interface {
-	FindDuePending(ctx context.Context, limit int) ([]string, error)
+	FindDuePending(ctx context.Context, limit int, after *domain.RecoveryCursor) ([]domain.DuePending, error)
+	RearmLeaseLessPending(ctx context.Context, limit int, orphanThreshold time.Duration) ([]string, error)
 }
 
-// RecoveryWorker re-enqueues orphaned pending rows: those genuinely due whose
-// enqueue was lost, or whose worker crashed and the visibility lease expired
-// (plan §0/§1). In-flight rows are hidden by their lease, so they are not
-// re-enqueued. Duplicate enqueues are harmless — the claim CAS admits only one.
+type taskEnqueuer interface {
+	Enqueue(ctx context.Context, deliveryLogID string) error
+}
+
+// RecoveryWorker re-enqueues work whose enqueue was lost or whose visibility
+// lease expired. Live leases are excluded; the claim CAS tolerates duplicates.
 type RecoveryWorker struct {
-	logs     dueFinder
-	queue    domain.TaskQueue
-	interval time.Duration
-	batch    int
+	logs            dueFinder
+	queue           taskEnqueuer
+	interval        time.Duration
+	batch           int
+	orphanThreshold time.Duration
 }
 
 // NewRecoveryWorker constructs the recovery scanner.
-func NewRecoveryWorker(logs dueFinder, queue domain.TaskQueue, interval time.Duration, batch int) *RecoveryWorker {
-	if interval <= 0 {
-		interval = 5 * time.Minute
+func NewRecoveryWorker(logs dueFinder, queue taskEnqueuer, interval time.Duration, batch int, orphanThreshold time.Duration) *RecoveryWorker {
+	return &RecoveryWorker{
+		logs: logs, queue: queue, interval: interval, batch: batch,
+		orphanThreshold: orphanThreshold,
 	}
-	if batch <= 0 {
-		batch = 100
-	}
-	return &RecoveryWorker{logs: logs, queue: queue, interval: interval, batch: batch}
 }
 
 // Run scans at startup and then on the interval until ctx is cancelled.
 func (w *RecoveryWorker) Run(ctx context.Context) error {
-	w.scan(ctx) // startup scan reclaims work lost across a restart
-	ticker := time.NewTicker(w.interval)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return nil
-		case <-ticker.C:
-			w.scan(ctx)
-		}
-	}
+	return runPeriodic(ctx, w.interval, true, w.scan)
 }
 
 func (w *RecoveryWorker) scan(ctx context.Context) {
-	ids, err := w.logs.FindDuePending(ctx, w.batch)
-	if err != nil {
-		if ctx.Err() == nil {
-			slog.Error("recovery: scan failed", "error", err)
-		}
-		return
-	}
 	requeued := 0
-	for _, id := range ids {
-		if err := w.queue.Enqueue(ctx, id); err != nil {
-			slog.Error("recovery: re-enqueue failed", "delivery_id", id, "error", err)
-			continue
+	var after *domain.RecoveryCursor
+	for {
+		items, err := w.logs.FindDuePending(ctx, w.batch, after)
+		if err != nil {
+			if ctx.Err() == nil {
+				slog.Error("recovery: scan failed", "error", err)
+			}
+			return
 		}
-		requeued++
+		for _, item := range items {
+			requeued += w.enqueue(ctx, item.ID)
+		}
+		if len(items) < w.batch {
+			break
+		}
+		last := items[len(items)-1]
+		after = &domain.RecoveryCursor{DueAt: last.DueAt, ID: last.ID}
+	}
+
+	for {
+		ids, err := w.logs.RearmLeaseLessPending(ctx, w.batch, w.orphanThreshold)
+		if err != nil {
+			if ctx.Err() == nil {
+				slog.Error("recovery: rearm lease-less rows failed", "error", err)
+			}
+			return
+		}
+		for _, id := range ids {
+			requeued += w.enqueue(ctx, id)
+		}
+		if len(ids) < w.batch {
+			break
+		}
 	}
 	if requeued > 0 {
 		slog.Info("recovery: re-enqueued orphaned pending rows", "count", requeued)
 	}
+}
+
+func (w *RecoveryWorker) enqueue(ctx context.Context, id string) int {
+	if err := w.queue.Enqueue(ctx, id); err != nil {
+		if ctx.Err() == nil {
+			slog.Error("recovery: re-enqueue failed", "delivery_id", id, "error", err)
+		}
+		return 0
+	}
+	return 1
 }

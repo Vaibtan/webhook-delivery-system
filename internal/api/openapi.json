@@ -42,7 +42,8 @@
             "format": "uuid"
           },
           "target_url": {
-            "type": "string"
+            "type": "string",
+            "maxLength": 2048
           },
           "event_types": {
             "type": "array",
@@ -585,7 +586,8 @@
             "required": true,
             "description": "HMAC-SHA256 signature of the raw request body in the form 'sha256=<hex>'.",
             "schema": {
-              "type": "string"
+              "type": "string",
+              "maxLength": 100
             },
             "example": "sha256=2c9a...f7"
           },
@@ -819,6 +821,7 @@
                 "properties": {
                   "target_url": {
                     "type": "string",
+                    "maxLength": 2048,
                     "description": "Destination URL. Must be https unless ALLOW_HTTP_URLS is enabled."
                   },
                   "event_types": {
@@ -1003,7 +1006,8 @@
                 "type": "object",
                 "properties": {
                   "target_url": {
-                    "type": "string"
+                    "type": "string",
+                    "maxLength": 2048
                   },
                   "event_types": {
                     "type": "array",

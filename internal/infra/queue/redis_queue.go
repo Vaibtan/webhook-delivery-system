@@ -17,7 +17,7 @@ import (
 // KeyQueue is the Redis key for the immediate-delivery LIST.
 const KeyQueue = "webhook:queue"
 
-// Queue implements domain.TaskQueue over a Redis LIST.
+// Queue stores immediate delivery work in a Redis LIST.
 type Queue struct {
 	rdb *redis.Client
 	key string
@@ -27,8 +27,6 @@ type Queue struct {
 func New(rdb *redis.Client) *Queue {
 	return &Queue{rdb: rdb, key: KeyQueue}
 }
-
-var _ domain.TaskQueue = (*Queue)(nil)
 
 // Enqueue LPUSHes a delivery-log id onto the queue (called post-commit).
 func (q *Queue) Enqueue(ctx context.Context, deliveryLogID string) error {

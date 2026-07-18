@@ -21,7 +21,7 @@ const (
 	StatusFinalFailure DeliveryStatus = "final_failure"
 )
 
-// DeliveryLog is one immutable delivery attempt (plan §0: one row per attempt).
+// DeliveryLog is one immutable delivery attempt.
 //
 //   - ID         = X-Webhook-Delivery-ID, unique per attempt.
 //   - WebhookID   = X-Webhook-ID, stable across all attempts of one ingested event.
@@ -68,6 +68,18 @@ type IngestResult struct {
 	WebhookID     string
 	DeliveryLogID string
 	Duplicate     bool
+}
+
+// DuePending is a recovery-scan row ordered by (DueAt, ID).
+type DuePending struct {
+	ID    string
+	DueAt time.Time
+}
+
+// RecoveryCursor is the keyset position for a single draining recovery scan.
+type RecoveryCursor struct {
+	DueAt time.Time
+	ID    string
 }
 
 // StatusCounts aggregates delivery_logs rows by status over a window.

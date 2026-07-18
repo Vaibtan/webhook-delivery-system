@@ -10,8 +10,7 @@ import (
 	"github.com/Vaibtan/webhook-delivery-system/internal/domain"
 )
 
-// DeliveryLogRepo implements domain.DeliveryLogRepository over PostgreSQL.
-// The CAS / single-transaction lifecycle methods are added in later slices.
+// DeliveryLogRepo persists delivery attempts in PostgreSQL.
 type DeliveryLogRepo struct {
 	pool *pgxpool.Pool
 }
@@ -20,8 +19,6 @@ type DeliveryLogRepo struct {
 func NewDeliveryLogRepo(pool *pgxpool.Pool) *DeliveryLogRepo {
 	return &DeliveryLogRepo{pool: pool}
 }
-
-var _ domain.DeliveryLogRepository = (*DeliveryLogRepo)(nil)
 
 const dlColumns = `id, webhook_id, subscription_id, target_url, payload, event_type,
 	attempt_number, replay_number, status, http_status, error_details, next_retry_at,
@@ -53,29 +50,6 @@ func scanDeliveryLog(row pgx.Row) (*domain.DeliveryLog, error) {
 		d.ErrorDetails = *errorDetails
 	}
 	return &d, nil
-}
-
-// Create inserts a delivery attempt row. The id is assigned by Postgres
-// (gen_random_uuid) unless preset; webhook_id is caller-minted. Timestamps are
-// read back. (The transactional ingest path in Slice 3 uses a dedicated method.)
-func (r *DeliveryLogRepo) Create(ctx context.Context, d *domain.DeliveryLog) error {
-	const q = `
-		INSERT INTO delivery_logs
-			(webhook_id, subscription_id, target_url, payload, event_type,
-			 attempt_number, replay_number, status, next_retry_at)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-		RETURNING id, in_dlq, created_at, updated_at`
-	if d.Status == "" {
-		d.Status = domain.StatusPending
-	}
-	err := r.pool.QueryRow(ctx, q,
-		d.WebhookID, d.SubscriptionID, d.TargetURL, d.Payload, nullStr(d.EventType),
-		d.AttemptNumber, d.ReplayNumber, string(d.Status), d.NextRetryAt,
-	).Scan(&d.ID, &d.InDLQ, &d.CreatedAt, &d.UpdatedAt)
-	if err != nil {
-		return fmt.Errorf("store: create delivery_log: %w", err)
-	}
-	return nil
 }
 
 // GetByID returns a single attempt row by id, or domain.ErrNotFound.

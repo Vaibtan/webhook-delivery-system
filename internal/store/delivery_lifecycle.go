@@ -2,9 +2,9 @@ package store
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
-	"strconv"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -12,7 +12,7 @@ import (
 	"github.com/Vaibtan/webhook-delivery-system/internal/domain"
 )
 
-// IngestPending runs the atomic ingest transaction (plan §5):
+// IngestPending runs the atomic ingest transaction:
 //
 //  1. If an idempotency key is present, INSERT … ON CONFLICT DO NOTHING. A first
 //     key takes the row; a repeat key conflicts → read back the stored webhook_id
@@ -22,6 +22,15 @@ import (
 // The dedupe record and the delivery row commit together, so a crash can never
 // acknowledge a key whose webhook row was not durably inserted.
 func (r *DeliveryLogRepo) IngestPending(ctx context.Context, p domain.IngestParams) (domain.IngestResult, error) {
+	if !json.Valid(p.Payload) {
+		return domain.IngestResult{}, fmt.Errorf("%w: payload must be valid JSON", domain.ErrInvalidInput)
+	}
+	if len(p.TargetURL) > domain.MaxTargetURLLength {
+		return domain.IngestResult{}, fmt.Errorf("%w: target_url must be at most %d characters", domain.ErrInvalidInput, domain.MaxTargetURLLength)
+	}
+	if err := domain.ValidateEventType(p.EventType); err != nil {
+		return domain.IngestResult{}, err
+	}
 	var result domain.IngestResult
 	err := r.inTx(ctx, "ingest", func(tx pgx.Tx) error {
 		webhookID := p.WebhookID
@@ -51,6 +60,9 @@ func (r *DeliveryLogRepo) IngestPending(ctx context.Context, p domain.IngestPara
 				result = domain.IngestResult{WebhookID: stored, Duplicate: true}
 				return nil
 			default:
+				if isForeignKeyViolation(err) {
+					return domain.ErrNotFound // subscription deleted after authentication
+				}
 				return fmt.Errorf("store: insert idempotency: %w", err)
 			}
 		}
@@ -104,13 +116,11 @@ func (r *DeliveryLogRepo) CountByStatusSince(ctx context.Context, since time.Tim
 	return counts, nil
 }
 
-// MarkSuccess CAS-transitions a pending row to success AND resets the
-// subscription's consecutive_failures to 0 (only when non-zero) in ONE
-// transaction (plan Adv §2). The status='pending' predicate makes only the first
-// finisher win; if it loses the CAS, the counter is left untouched.
-func (r *DeliveryLogRepo) MarkSuccess(ctx context.Context, id, subscriptionID string, httpStatus int) (bool, error) {
-	won := false
-	err := r.inTx(ctx, "success", func(tx pgx.Tx) error {
+// MarkSuccess CAS-transitions a pending row to success and resets a non-zero
+// subscription failure counter in the same transaction. reset reports whether
+// cached subscription state changed.
+func (r *DeliveryLogRepo) MarkSuccess(ctx context.Context, id, subscriptionID string, httpStatus int) (won, reset bool, err error) {
+	err = r.inTx(ctx, "success", func(tx pgx.Tx) error {
 		const cas = `UPDATE delivery_logs
 			SET status = 'success', http_status = $2, error_details = NULL, updated_at = NOW()
 			WHERE id = $1 AND status = 'pending'`
@@ -121,22 +131,23 @@ func (r *DeliveryLogRepo) MarkSuccess(ctx context.Context, id, subscriptionID st
 		if tag.RowsAffected() == 0 {
 			return nil // lost the CAS
 		}
-		const reset = `UPDATE subscriptions SET consecutive_failures = 0, updated_at = NOW()
+		const resetCounter = `UPDATE subscriptions SET consecutive_failures = 0, updated_at = NOW()
 			WHERE id = $1 AND consecutive_failures <> 0`
-		if _, err := tx.Exec(ctx, reset, subscriptionID); err != nil {
+		tag, err = tx.Exec(ctx, resetCounter, subscriptionID)
+		if err != nil {
 			return fmt.Errorf("store: reset consecutive_failures: %w", err)
 		}
 		won = true
+		reset = tag.RowsAffected() == 1
 		return nil
 	})
 	if err != nil {
-		return false, err
+		return false, false, err
 	}
-	return won, nil
+	return won, reset, nil
 }
 
-// FinalizeFailure is the terminal-failure transaction (plan §0/Adv §1/Adv §2): in
-// ONE tx it CAS-transitions the row to final_failure + in_dlq=TRUE AND increments
+// FinalizeFailure CAS-transitions the row to final_failure + in_dlq=TRUE and increments
 // the subscription's consecutive_failures, auto-disabling it (is_active=FALSE) at
 // disableThreshold. Returns won (CAS succeeded → caller LPUSHes the DLQ) and
 // disabled (the sub just crossed the threshold → caller evicts its cache).
@@ -179,21 +190,22 @@ func (r *DeliveryLogRepo) FinalizeFailure(ctx context.Context, id, subscriptionI
 	return won, disabled, nil
 }
 
-// MarkFinalFailure CAS-transitions a pending row to final_failure AND sets
-// in_dlq=TRUE in the SAME statement, so the durable DLQ signal commits atomically
-// with the terminal status (plan Adv §1). The caller LPUSHes post-commit.
-func (r *DeliveryLogRepo) MarkFinalFailure(ctx context.Context, id string, httpStatus *int, errorDetails string) (bool, error) {
+// MarkDropped CAS-transitions a pending row to a terminal, non-DLQ state. The
+// final_failure status remains useful to operators, while in_dlq=FALSE prevents
+// the reconciler from publishing an intentional policy drop to the DLQ.
+func (r *DeliveryLogRepo) MarkDropped(ctx context.Context, id string, errorDetails string) (bool, error) {
 	const q = `UPDATE delivery_logs
-		SET status = 'final_failure', in_dlq = TRUE, http_status = $2, error_details = $3, updated_at = NOW()
+		SET status = 'final_failure', in_dlq = FALSE, http_status = NULL,
+			error_details = $2, next_retry_at = NULL, updated_at = NOW()
 		WHERE id = $1 AND status = 'pending'`
-	tag, err := r.pool.Exec(ctx, q, id, httpStatus, nullStr(errorDetails))
+	tag, err := r.pool.Exec(ctx, q, id, nullStr(errorDetails))
 	if err != nil {
-		return false, fmt.Errorf("store: mark final_failure: %w", err)
+		return false, fmt.Errorf("store: mark dropped: %w", err)
 	}
 	return tag.RowsAffected() == 1, nil
 }
 
-// FailAndScheduleRetry runs the failed→successor transaction (plan §0/§4b):
+// FailAndScheduleRetry runs the failed-to-successor transaction:
 //
 //  1. CAS the prev row pending→failed_attempt (0 rows ⇒ another worker already
 //     finalized it ⇒ won=false, abort with no side effects).
@@ -238,8 +250,8 @@ func (r *DeliveryLogRepo) FailAndScheduleRetry(ctx context.Context, prevID strin
 }
 
 // RescheduleSamePending pushes a pending row's next_retry_at to `at` WITHOUT
-// consuming an attempt (breaker denial / per-sub concurrency requeue, plan §3 /
-// Adv §3). The caller ZADDs post-commit. attempt_number is untouched.
+// consuming an attempt. The caller schedules it after commit; attempt_number is
+// untouched.
 func (r *DeliveryLogRepo) RescheduleSamePending(ctx context.Context, id string, at time.Time) (bool, error) {
 	const q = `UPDATE delivery_logs SET next_retry_at = $2, updated_at = NOW()
 		WHERE id = $1 AND status = 'pending'`
@@ -250,38 +262,81 @@ func (r *DeliveryLogRepo) RescheduleSamePending(ctx context.Context, id string, 
 	return tag.RowsAffected() == 1, nil
 }
 
-// FindDuePending returns ids of pending rows whose next_retry_at is past due —
-// either a lost enqueue or a crashed worker whose lease expired. In-flight rows
-// are hidden by their (future) lease, so they are not returned.
-func (r *DeliveryLogRepo) FindDuePending(ctx context.Context, limit int) ([]string, error) {
-	if limit <= 0 {
-		limit = 100
+// FindDuePending returns a stable keyset page of due pending rows.
+func (r *DeliveryLogRepo) FindDuePending(ctx context.Context, limit int, after *domain.RecoveryCursor) ([]domain.DuePending, error) {
+	const base = `SELECT id, next_retry_at
+		FROM delivery_logs
+		WHERE status = 'pending' AND next_retry_at <= NOW()`
+	var (
+		rows pgx.Rows
+		err  error
+	)
+	if after == nil {
+		rows, err = r.pool.Query(ctx, base+`
+			ORDER BY next_retry_at ASC, id ASC
+			LIMIT $1`, limit)
+	} else {
+		rows, err = r.pool.Query(ctx, base+`
+			AND (next_retry_at > $2 OR (next_retry_at = $2 AND id > $3))
+			ORDER BY next_retry_at ASC, id ASC
+			LIMIT $1`, limit, after.DueAt, after.ID)
 	}
-	const q = `SELECT id FROM delivery_logs
-		WHERE status = 'pending' AND next_retry_at <= NOW()
-		ORDER BY next_retry_at ASC
-		LIMIT $1`
-	rows, err := r.pool.Query(ctx, q, limit)
 	if err != nil {
 		return nil, fmt.Errorf("store: find due pending: %w", err)
 	}
 	defer rows.Close()
 
-	ids := make([]string, 0, limit)
+	items := make([]domain.DuePending, 0, limit)
 	for rows.Next() {
-		var id string
-		if err := rows.Scan(&id); err != nil {
-			return nil, fmt.Errorf("store: scan due pending id: %w", err)
+		var item domain.DuePending
+		if err := rows.Scan(&item.ID, &item.DueAt); err != nil {
+			return nil, fmt.Errorf("store: scan due pending: %w", err)
 		}
-		ids = append(ids, id)
+		items = append(items, item)
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("store: iterate due pending: %w", err)
 	}
+	return items, nil
+}
+
+// RearmLeaseLessPending atomically claims and rearms one batch of sufficiently
+// old rows that have no visibility lease. SKIP LOCKED lets concurrent recovery
+// workers divide the batch without duplicate ownership.
+func (r *DeliveryLogRepo) RearmLeaseLessPending(ctx context.Context, limit int, orphanThreshold time.Duration) ([]string, error) {
+	const q = `WITH candidates AS (
+		SELECT id FROM delivery_logs
+		WHERE status = 'pending' AND next_retry_at IS NULL
+		  AND created_at <= NOW() - ($2 || ' seconds')::interval
+		ORDER BY created_at ASC, id ASC
+		LIMIT $1
+		FOR UPDATE SKIP LOCKED
+	)
+	UPDATE delivery_logs AS d
+	SET next_retry_at = NOW(), updated_at = NOW()
+	FROM candidates AS c
+	WHERE d.id = c.id
+	RETURNING d.id`
+	rows, err := r.pool.Query(ctx, q, limit, secondsArg(orphanThreshold))
+	if err != nil {
+		return nil, fmt.Errorf("store: rearm lease-less pending: %w", err)
+	}
+	defer rows.Close()
+	ids := make([]string, 0, limit)
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, fmt.Errorf("store: scan rearmed pending: %w", err)
+		}
+		ids = append(ids, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("store: iterate rearmed pending: %w", err)
+	}
 	return ids, nil
 }
 
-// ClaimPending applies the visibility lease (plan §0/§1): a conditional CAS that
+// ClaimPending applies the visibility lease with a conditional CAS that
 // stamps next_retry_at into the future ONLY if the row is pending AND currently
 // due (next_retry_at <= now()). The due predicate is what makes the claim the
 // mutual-exclusion point — two workers draining duplicate queue entries for the
@@ -291,11 +346,7 @@ func (r *DeliveryLogRepo) ClaimPending(ctx context.Context, id string, lease tim
 	const q = `UPDATE delivery_logs
 		SET next_retry_at = NOW() + ($2 || ' seconds')::interval, updated_at = NOW()
 		WHERE id = $1 AND status = 'pending' AND next_retry_at <= NOW()`
-	leaseSecs := int64(lease.Seconds())
-	if leaseSecs < 1 {
-		leaseSecs = 1
-	}
-	tag, err := r.pool.Exec(ctx, q, id, strconv.FormatInt(leaseSecs, 10))
+	tag, err := r.pool.Exec(ctx, q, id, secondsArg(lease))
 	if err != nil {
 		if isInvalidUUID(err) {
 			return false, nil
