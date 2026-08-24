@@ -1,7 +1,7 @@
 # Multi-stage build for the Go webhook delivery system.
 # Stage 1 compiles a static binary; stage 2 is a minimal distroless image.
 
-FROM golang:1.26-alpine AS builder
+FROM golang:1.27-alpine AS builder
 WORKDIR /src
 
 # Cache module downloads.
